@@ -329,15 +329,19 @@ func (e *windowEngine) CloseLogin() {
 //
 //  1. 数据回传：挂 window.__ltoolsCollect()，Go 端 CollectCurrentPage 调它把当前页
 //     outerHTML 经 Wails 事件 c1688:page-html 发回。
-//  2. 导航拦截（路线 B 强化）：把"会开新窗口 / 跳到当前窗口外"的意图强制改成**当前窗口内跳转**，
-//     降低 WebView2 COM 层 NewWindowRequested 触发频率（真正的兜底关窗靠 Go 端 OnCreate）：
-//     - 捕获阶段 document click：拦 a[target=_blank|_parent] 与非 1688 外链 → preventDefault + location.href。
-//     - 捕获阶段 document submit：拦 form[target=_blank|_parent] → preventDefault + location.href。
-//     - 劫持 window.open（用 Object.defineProperty + configurable:false 让页面无法还原）：
+//  2. 导航拦截（强化：事件 + 原型 + window.open 三层全拦）：把"会开新窗口 / 跳到当前窗口外"的
+//     意图**全部**强制改成**当前窗口内跳转**，降低 WebView2 COM 层 NewWindowRequested 触发频率
+//     （真正的兜底关窗靠 Go 端 OnCreate）：
+//     - 捕获阶段 document click：拦所有 a[href]，target=_blank/_parent/_top 或跨域外链 → preventDefault + location.href。
+//     - 捕获阶段 document submit：拦 form target=_blank/_parent/_top → preventDefault + location.href。
+//     - 原型级拦截（编程式 a.click()/form.submit() 不产生 document 捕获事件，document 拦不到）：
+//       重写 HTMLAnchorElement.prototype.click / HTMLFormElement.prototype.submit，开新窗意图 → location 跳转。
+//     - 劫持 window.open（Object.defineProperty + configurable:false 让页面无法还原）：
 //       url 非空 → 当前窗口 location 跳转；否则返回 fake window。同时劫持 document.defaultView.open。
 //
 // 幂等标记：window.__ltoolsBridgeInstalled。因为 1688 搜索/翻页是整页导航（新文档销毁 JS），
-// Go 端 installBridge 循环会周期性重注入（150ms），使 hook 在每次导航后 150ms 内恢复。
+// Go 端 installBridge 循环会周期性重注入（80ms）；脚本自身在文档 loading 阶段挂 DOMContentLoaded 钩子，
+// 把"整页导航后 hook 空窗"从 80ms 压到 ~0，使"导航完成瞬间点 _blank 链接/翻页"也能当场重定向。
 const bridgeJS = `
 (function(){
   // ---- 幂等：本文档已装则直接返回 ----
@@ -358,29 +362,31 @@ const bridgeJS = `
     } catch (err) { return 'err:' + err; }
   };
 
-  // ---- 2. 导航拦截（强化）----
+  // ---- 2. 导航拦截（强化：事件 + 原型 + window.open 三层全拦）----
   const is1688 = function(u){
     if (!u) return true;
-    try { return /(^|\.)1688\.com$/i.test(new URL(u, location.href).hostname); } catch(e){ return true; }
+    try { return /(^|\\.)1688\\.com$/i.test(new URL(u, location.href).hostname); } catch(e){ return true; }
+  };
+  // 只有"会开新窗口 / 跳到当前窗口外"的才拦；同域普通链接/表单放行（保持 1688 正常点击/翻页）
+  const willOpenNew = function(target, href){
+    const t = (target || '').toLowerCase();
+    if (t === '_blank' || t === '_parent' || t === '_top') return true;
+    if (href && !is1688(href) && /^https?:/i.test(href)) return true; // 跨域外链
+    return false;
   };
   const fakeWin = function(){
     return { close:function(){}, focus:function(){}, closed:false, location:{ href:"" }, document:{ write:function(){}, close:function(){} } };
   };
-  // 统一处理"开新窗"意图：url 非空 → 当前窗口跳转；否则 fake window
+  // 统一处理"开新窗"意图：url 非空 → 当前窗口跳转；否则返回 fake window
   const openHook = function(url, name, features){
-    if (typeof url === 'string' && url.length && url !== 'about:blank') {
-      if (is1688(url) || !url.match(/^https?:/i)) {
-        try { window.location.href = url; } catch(e) {}
-        return fakeWin();
-      }
-      // 非 1688 外链：也当前窗口打开（保持"始终一个子窗口"）
+    if (typeof url === 'string' && url.length && url !== 'about:blank' && !/^about:/i.test(url)) {
       try { window.location.href = url; } catch(e) {}
       return fakeWin();
     }
     return fakeWin();
   };
 
-  // (a) 捕获阶段拦截 <a> 点击：开新窗 / 跳出 1688 → 改当前窗口
+  // (a) 捕获阶段拦 <a> 点击：开新窗 / 跳出 1688 → 改当前窗口
   document.addEventListener('click', function(ev){
     try {
       const a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
@@ -388,8 +394,7 @@ const bridgeJS = `
       const tgt = (a.getAttribute('target') || '').toLowerCase();
       const href = a.getAttribute('href') || a.href;
       if (!href || href === '#' || href === 'javascript:;') return;
-      const willNew = tgt === '_blank' || tgt === '_parent' || tgt === '_top';
-      if (willNew) {
+      if (willOpenNew(tgt, href)) {
         ev.preventDefault();
         ev.stopPropagation();
         try { window.location.href = href; } catch(e) {}
@@ -397,14 +402,14 @@ const bridgeJS = `
     } catch(e) {}
   }, true);
 
-  // (b) 捕获阶段拦截 <form target=_blank|_parent> 提交 → 改当前窗口
+  // (b) 捕获阶段拦 <form target=_blank|_parent|_top> 提交 → 改当前窗口
   document.addEventListener('submit', function(ev){
     try {
       const f = ev.target;
       if (!f || !f.tagName || f.tagName !== 'FORM') return;
       const tgt = (f.getAttribute('target') || '').toLowerCase();
-      if (tgt === '_blank' || tgt === '_parent' || tgt === '_top') {
-        const action = f.getAttribute('action') || '';
+      const action = f.getAttribute('action') || '';
+      if (willOpenNew(tgt, action)) {
         if (action && action !== '#') {
           ev.preventDefault();
           ev.stopPropagation();
@@ -414,8 +419,45 @@ const bridgeJS = `
     } catch(e) {}
   }, true);
 
-  // (c) 劫持 window.open：用 defineProperty + configurable:false 让页面无法还原。
-  //     同时劫持 document.defaultView.open（某些压缩 bundle 走这条读原始 open）。
+  // (c) 原型级拦截：编程式 a.click() / form.submit() 不触发 document 捕获事件，
+  //     重写原型方法，开新窗意图 → 改 location 跳转（保持"始终一个子窗口"）
+  const anchorClick = HTMLAnchorElement.prototype.click;
+  if (anchorClick) {
+    HTMLAnchorElement.prototype.click = function(){
+      try {
+        const a = this;
+        if (a && a.tagName === 'A') {
+          const tgt = (a.getAttribute('target') || '').toLowerCase();
+          const href = a.getAttribute('href') || a.href;
+          if (href && href !== '#' && href !== 'javascript:;' && willOpenNew(tgt, href)) {
+            try { window.location.href = href; } catch(e) {}
+            return;
+          }
+        }
+      } catch(e) {}
+      return anchorClick.apply(this, arguments);
+    };
+  }
+  const formSubmit = HTMLFormElement.prototype.submit;
+  if (formSubmit) {
+    HTMLFormElement.prototype.submit = function(){
+      try {
+        const f = this;
+        if (f && f.tagName === 'FORM') {
+          const tgt = (f.getAttribute('target') || '').toLowerCase();
+          const action = f.getAttribute('action') || '';
+          if (action && action !== '#' && willOpenNew(tgt, action)) {
+            try { window.location.href = action; } catch(e) {}
+            return;
+          }
+        }
+      } catch(e) {}
+      return formSubmit.apply(this, arguments);
+    };
+  }
+
+  // (d) 劫持 window.open：Object.defineProperty + configurable:false 让页面无法还原。
+  //     同时劫持 document.defaultView.open（某些压缩 bundle 走这条读原始 open）
   const defineOpen = function(obj){
     try {
       Object.defineProperty(obj, 'open', {
@@ -427,23 +469,30 @@ const bridgeJS = `
   };
   defineOpen(window);
   if (document && document.defaultView) { try { defineOpen(document.defaultView); } catch(e) {} }
+
+  // (e) 文档 loading 阶段挂 DOMContentLoaded 钩子：整页导航后新文档 readyState=loading 时
+  //     本文档上下文销毁，Go 端 80ms 轮询会重注入；若 hook 注入早于 load，此钩子确保
+  //     load 完成前 hook 已就位（把"导航后空窗"从 80ms 压到 ~0）
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', function(){ /* hook 已在本文档作用域装好 */ }, { once: true });
+  }
 })();
 `
 
 // installBridge 在子窗口里**持久**注入 bridgeJS（数据回传 + 导航拦截）。
 // Wails 子窗口是独立 WebView；bridge 通过 Wails 全局事件总线回传。
 // 用 currentWindow() 实时取窗口句柄（而非 e.win 字段），避免多实例 / 过期引用。
-// 循环：每 500ms 注入一次（幂等），直到 closeBridgeLoop 触发（CloseWindow）。
+// 循环：每 80ms 注入一次（幂等），直到 closeBridgeLoop 触发（CloseWindow）。
 // 因 1688 搜索/翻页是整页导航会销毁 JS 上下文，周期性重注入是导航 hook 能"跨导航存活"的关键。
 func (e *windowEngine) installBridge() {
 	if e.app == nil {
 		return
 	}
-	// missingTicks：子窗口连续不存在的 tick 数；超过 67（=10s @150ms）视为窗口已关且不会立即重开，退出循环。
+	// missingTicks：子窗口连续不存在的 tick 数；超过 125（=10s @80ms）视为窗口已关且不会立即重开，退出循环。
 	// 窗口存在时归零。这样循环既能在"整页导航间隙"保持存活（窗口一直在），又能在"窗口关闭"后退出。
-	// 轮询间隔压到 150ms：压缩整页导航后 JS 上下文销毁 → hook 恢复的窗口期，
-	// 降低 WebView2 COM 层 NewWindowRequested 在 hook 空窗期内被触发的概率。
-	const maxMissingTicks = 67
+	// 轮询间隔压到 80ms：配合 bridgeJS 的 DOMContentLoaded 钩子，把"整页导航后 JS 上下文销毁 →
+	// hook 恢复"的空窗从 150ms 压到 ~0，大幅降低 WebView2 COM 层 NewWindowRequested 在空窗内被触发。
+	const maxMissingTicks = 125
 	missingTicks := 0
 	for {
 		// 可被 CloseWindow 终止
@@ -462,7 +511,7 @@ func (e *windowEngine) installBridge() {
 			missingTicks = 0
 			w.ExecJS(bridgeJS)
 		}
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(80 * time.Millisecond)
 	}
 }
 
