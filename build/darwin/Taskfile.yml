@@ -30,7 +30,6 @@ tasks:
     internal: true
     deps:
       - task: common:go:mod:tidy
-      - task: common:build:lx-music-service
       - task: common:build:frontend
         vars:
           BUILD_FLAGS:
@@ -147,25 +146,7 @@ tasks:
       - cp build/darwin/icons.icns "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources"
       - cp "{{.BIN_DIR}}/{{.APP_NAME}}" "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/MacOS"
       - cp build/darwin/Info.plist "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents"
-      - task: copy:music-service
       - task: '{{if eq OS "darwin"}}codesign:adhoc{{else}}codesign:skip{{end}}'
-
-  copy:music-service:
-    summary: Copies lx-music-service bundle to app bundle (optimized)
-    internal: true
-    deps:
-      - task: common:build:lx-music-service
-    cmds:
-      - echo "Copying lx-music-service bundle to app bundle..."
-      - mkdir -p "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources/lx-music-service/dist"
-      - cp -r lx-music-service/dist/* "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources/lx-music-service/dist/"
-      - echo "Bundle contents:"
-      - ls -lh "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources/lx-music-service/dist/"
-      - echo "Bundle size:"
-      - du -sh "{{.BIN_DIR}}/{{.APP_NAME}}.app/Contents/Resources/lx-music-service"
-    preconditions:
-      - sh: '[ -f "lx-music-service/dist/server.bundle.js" ]'
-        msg: "lx-music-service/dist/server.bundle.js not found. Run 'task common:build:lx-music-service' first."
 
   codesign:adhoc:
     summary: Ad-hoc signs the app bundle (macOS only)

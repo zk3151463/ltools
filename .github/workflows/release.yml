@@ -106,7 +106,7 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: 'lx-music-service/package-lock.json'
+          cache-dependency-path: 'frontend/package-lock.json'
 
       - name: Cache Linux apt packages
         if: matrix.goos == 'linux'
@@ -158,24 +158,6 @@ jobs:
         run: |
           curl -sL https://taskfile.dev/install.sh | sh
           echo "$HOME/bin" >> $GITHUB_PATH
-
-      - name: Install music service dependencies
-        run: |
-          cd lx-music-service
-          npm install --production
-          npm prune --production
-
-      - name: Build music service bundle
-        run: |
-          cd lx-music-service
-          # 安装 devDependencies（包括 esbuild）用于构建
-          npm install
-          # 运行构建脚本生成 dist/server.bundle.js 和 dist/sources/
-          npm run build
-          # 复制构建产物到 plugins 目录（供 Go embed 使用）
-          mkdir -p ../plugins/musicplayer/lx-music-service
-          cp -r dist ../plugins/musicplayer/lx-music-service/
-          echo "✓ Music service bundle built and copied to plugins directory"
 
       - name: Build and package application
         run: wails3 package

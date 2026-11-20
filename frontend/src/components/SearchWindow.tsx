@@ -2,7 +2,6 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Icon } from './Icon';
 import { Events } from '@wailsio/runtime';
 import * as SearchWindowService from '../../bindings/ltools/internal/plugins/searchwindowservice';
-import * as AppLauncherService from '../../bindings/ltools/plugins/applauncher/applauncherservice';
 import { usePlugins } from '../plugins/usePlugins';
 import { getPluginIcon, getPluginIconName } from '../utils/pluginHelpers';
 import { PluginState, PluginMetadata } from '../../bindings/ltools/internal/plugins';
@@ -209,14 +208,10 @@ export function SearchWindow() {
     try {
       console.log('[SearchWindow] Searching for:', searchQuery);
 
-      // 同时调用插件搜索和应用搜索
-      const [pluginResults, appResults] = await Promise.all([
-        SearchWindowService.Search(searchQuery),
-        AppLauncherService.Search(searchQuery).catch(() => [])
-      ]);
+      // 调用插件/路径搜索
+      const pluginResults = await SearchWindowService.Search(searchQuery);
 
       console.log('[SearchWindow] Plugin results:', pluginResults);
-      console.log('[SearchWindow] App results:', appResults);
 
       // 转换插件结果格式，并解码 Unicode 转义字符
       const searchResults: SearchResult[] = pluginResults.map((item: any) => ({
@@ -231,22 +226,8 @@ export function SearchWindow() {
         isDirectory: item.isDirectory,  // 是否为目录
       }));
 
-      // 转换应用结果格式，并解码 Unicode 转义字符
-      const appResultsFormatted: SearchResult[] = appResults.map((item: any) => {
-        // 使用 iconData，如果没有则使用默认图标
-        const icon = item.iconData || '🚀';
-        console.log('[SearchWindow] App icon for', item.name, ':', icon.substring(0, 50) + '...');
-        return {
-          appId: item.id,
-          name: decodeUnicode(item.name || ''),
-          description: decodeUnicode(item.description || ''),
-          icon: icon,
-          type: 'app',
-        };
-      });
-
       // 合并结果
-      const allResults = [...searchResults, ...appResultsFormatted];
+      const allResults = [...searchResults];
 
       console.log('[SearchWindow] Total results:', allResults.length);
       setResults(allResults);

@@ -14,28 +14,30 @@ import * as plugins$0 from "../../../../../ltools/internal/plugins/models.js";
 import * as update$0 from "../../../../../ltools/internal/update/models.js";
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-ignore: Unused imports
-import * as imageprocessor$0 from "../../../../../ltools/plugins/imageprocessor/models.js";
+import * as col1688$0 from "../../../../../ltools/plugins/col1688/models.js";
 
 function configure() {
     Object.freeze(Object.assign($Create.Events, {
-        "imageprocessor:complete": $$createType1,
-        "imageprocessor:files-dropped": $$createType2,
-        "imageprocessor:progress": $$createType1,
-        "search:results": $$createType5,
-        "update:available": $$createType7,
-        "url:open": $$createType8,
+        "c1688:log": $$createType0,
+        "c1688:page-html": $$createType1,
+        "c1688:progress": $$createType2,
+        "c1688:result": $$createType4,
+        "search:results": $$createType7,
+        "update:available": $$createType9,
+        "url:open": $$createType1,
     }));
 }
 
 // Private type creation functions
-const $$createType0 = imageprocessor$0.BatchProgress.createFrom;
-const $$createType1 = $Create.Nullable($$createType0);
+const $$createType0 = col1688$0.LogEntry.createFrom;
+const $$createType1 = $Create.Map($Create.Any, $Create.Any);
 const $$createType2 = $Create.Map($Create.Any, $Create.Any);
-const $$createType3 = plugins$0.SearchResult.createFrom;
-const $$createType4 = $Create.Nullable($$createType3);
-const $$createType5 = $Create.Array($$createType4);
-const $$createType6 = update$0.UpdateInfo.createFrom;
-const $$createType7 = $Create.Nullable($$createType6);
-const $$createType8 = $Create.Map($Create.Any, $Create.Any);
+const $$createType3 = col1688$0.Supplier.createFrom;
+const $$createType4 = $Create.Array($$createType3);
+const $$createType5 = plugins$0.SearchResult.createFrom;
+const $$createType6 = $Create.Nullable($$createType5);
+const $$createType7 = $Create.Array($$createType6);
+const $$createType8 = update$0.UpdateInfo.createFrom;
+const $$createType9 = $Create.Nullable($$createType8);
 
 configure();

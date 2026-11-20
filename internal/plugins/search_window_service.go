@@ -7,12 +7,11 @@ import (
 	"sync"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
-	"ltools/plugins/applauncher/apps"
 )
 
 // AppLauncherService 接口定义（避免循环依赖）
+// 仅保留 LaunchApp，应用搜索由前端按需对接，不依赖具体插件实现
 type AppLauncherService interface {
-	Search(query string) ([]*apps.AppInfo, error)
 	LaunchApp(appID string) error
 }
 

@@ -2,8 +2,6 @@ import { useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Events } from '@wailsio/runtime'
 import * as SearchWindowService from '../../bindings/ltools/internal/plugins/searchwindowservice'
-import * as Screenshot2Service from '../../bindings/ltools/plugins/screenshot2/screenshot2service'
-import * as StickyService from '../../bindings/ltools/plugins/sticky/stickyservice'
 
 /**
  * 全局快捷键处理 Hook
@@ -24,24 +22,6 @@ export function useGlobalShortcuts() {
         console.log('[useGlobalShortcuts] Handling search window shortcut')
         SearchWindowService.Toggle().catch((error: any) => {
           console.error('[useGlobalShortcuts] Failed to toggle search window:', error)
-        })
-        return
-      }
-
-      // 截图快捷键（由独立窗口处理）
-      if (pluginId === 'screenshot2.window.builtin') {
-        console.log('[useGlobalShortcuts] Handling screenshot2 shortcut')
-        Screenshot2Service.StartCapture().catch((error: any) => {
-          console.error('[useGlobalShortcuts] Failed to trigger screenshot2:', error)
-        })
-        return
-      }
-
-      // 便利贴快捷键 - 创建新便利贴
-      if (pluginId === 'sticky.builtin') {
-        console.log('[useGlobalShortcuts] Handling sticky shortcut - creating new note')
-        StickyService.CreateNote().catch((error: any) => {
-          console.error('[useGlobalShortcuts] Failed to create sticky note:', error)
         })
         return
       }

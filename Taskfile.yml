@@ -12,9 +12,10 @@ vars:
   APP_NAME: "ltools"
   BIN_DIR: "bin"
   VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
-  # 从 build/config.yml 的 info 部分读取版本号
-  VERSION:
-    sh: awk '/^info:/{found=1} found && /^[[:space:]]*version:/{gsub(/["'\'']/, "", $2); print $2; exit}' build/config.yml
+  # 版本号（与 build/config.yml 的 info.version 保持同步，改动时需手动更新此处）。
+  # 使用静态值而非 shell 脚本：原来的 awk 脚本在 Windows 上因 PATH 中没有 awk 而报错(exit 127)，
+  # 且 Task 会急切求值所有 vars，导致 task dev 等未用到 VERSION 的命令也失败。
+  VERSION: "0.1.8"
 
 tasks:
   build:
@@ -66,13 +67,11 @@ tasks:
     summary: Build and package application for production distribution
     desc: |
       Complete production build including:
-      1. Installing all dependencies (frontend + lx-music-service)
+      1. Installing all dependencies (frontend)
       2. Building the application
       3. Preparing distribution package
 
       Usage: task package:production
-    deps:
-      - task: common:package:lx-music-service
     cmds:
       - task: build
       - |
@@ -80,9 +79,6 @@ tasks:
         echo ""
         echo "Next steps:"
         echo "  1. The application binary is in: bin/"
-        echo "  2. Ensure lx-music-service/ is distributed alongside the binary"
-        echo "  3. Users need Node.js >= 16.0.0 installed"
         echo ""
         echo "Distribution structure:"
         ls -lh bin/ || true
-        du -sh lx-music-service/ || true

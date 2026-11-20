@@ -1,6 +1,5 @@
 import { useEffect, useRef } from 'react'
 import { useParams, useLocation } from 'react-router-dom'
-import * as ProcessManagerService from '../../../bindings/ltools/plugins/processmanager/processmanagerservice'
 import * as PluginService from '../../../bindings/ltools/internal/plugins/pluginservice'
 import type { PluginLifecycleHandler } from '../types'
 
@@ -9,16 +8,10 @@ import type { PluginLifecycleHandler } from '../types'
  * 每个插件可以注册自己的进入/离开处理函数
  */
 const pluginEnterHandlers: Record<string, PluginLifecycleHandler> = {
-  'processmanager.builtin': async () => {
-    await ProcessManagerService.EnterView()
-  },
   // 未来可扩展其他插件
 }
 
 const pluginLeaveHandlers: Record<string, PluginLifecycleHandler> = {
-  'processmanager.builtin': async () => {
-    await ProcessManagerService.LeaveView()
-  },
   // 未来可扩展其他插件
 }
 

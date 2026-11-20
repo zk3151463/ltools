@@ -7,6 +7,7 @@ import type { IconName } from '../components/Icon';
  */
 export const PLUGIN_ICON_MAP: Record<string, { icon?: IconName; emoji: string }> = {
   // 内置插件
+  'c1688.builtin': { icon: 'funnel', emoji: '📥' },
   'datetime.builtin': { icon: 'clock', emoji: '🕐' },
   'calculator.builtin': { icon: 'calculator', emoji: '🧮' },
   'clipboard.builtin': { icon: 'clipboard', emoji: '📋' },

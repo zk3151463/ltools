@@ -13,15 +13,11 @@ type IgnoreRules struct {
 // DefaultIgnorePatterns contains patterns that are always excluded from sync.
 var DefaultIgnorePatterns = []string{
 	// Large model files
-	"localtranslate/models/",
 	"*.gguf",
 	"*.bin",
 
 	// Update files
 	"updates",
-
-	// Music Server files
-	"lx-music-service",
 
 	// Temporary files
 	"*.tmp",

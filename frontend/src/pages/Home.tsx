@@ -1,20 +1,12 @@
-import { useMemo, useEffect, useState, useCallback } from 'react'
+import { useMemo } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Icon } from '../components/Icon'
 import { usePlugins } from '../plugins/usePlugins'
 import { getPluginIcon, getPluginIconName } from '../utils/pluginHelpers'
 import { PluginMetadata, PluginState } from '../../bindings/ltools/internal/plugins'
-import { SysInfoService } from '../../bindings/ltools/plugins/sysinfo'
-import { Events } from '@wailsio/runtime'
 import { t } from '@/i18n';
 
 // ==================== 类型定义 ====================
-
-interface SystemStatus {
-  cpu: number
-  memory: number
-  uptime: string
-}
 
 // ==================== 子组件 ====================
 
@@ -252,100 +244,6 @@ function RecentPlugins({
   )
 }
 
-/**
- * 系统状态卡片
- */
-function SystemStatusCard({ status }: { status: SystemStatus | null }) {
-  if (!status) {
-    return (
-      <div className="glass-light rounded-xl p-4">
-        <div className="flex items-center gap-2 mb-3">
-          <Icon name="server" size={14} color="#22C55E" />
-          <h3 className="text-sm font-medium text-white/60">{t('系统状态')}</h3>
-        </div>
-        <div className="space-y-3 animate-pulse">
-          <div className="h-8 bg-white/5 rounded" />
-          <div className="h-8 bg-white/5 rounded" />
-        </div>
-      </div>
-    )
-  }
-
-  const getCpuColor = (usage: number) => {
-    if (usage > 80) return 'text-[#EF4444]'
-    if (usage > 60) return 'text-[#F59E0B]'
-    return 'text-[#7C3AED]'
-  }
-
-  const getCpuBg = (usage: number) => {
-    if (usage > 80) return 'bg-[#EF4444]'
-    if (usage > 60) return 'bg-[#F59E0B]'
-    return 'bg-[#7C3AED]'
-  }
-
-  const getMemoryColor = (usage: number) => {
-    if (usage > 80) return 'text-[#EF4444]'
-    if (usage > 60) return 'text-[#F59E0B]'
-    return 'text-[#22C55E]'
-  }
-
-  const getMemoryBg = (usage: number) => {
-    if (usage > 80) return 'bg-[#EF4444]'
-    if (usage > 60) return 'bg-[#F59E0B]'
-    return 'bg-[#22C55E]'
-  }
-
-  return (
-    <div className="glass-light rounded-xl p-4">
-      <div className="flex items-center justify-between mb-4">
-        <h3 className="text-sm font-medium text-white/60 flex items-center gap-2">
-          <Icon name="server" size={14} color="#22C55E" />
-          {t('系统状态')}
-        </h3>
-        <span className="text-xs text-white/30">{status.uptime}</span>
-      </div>
-
-      {/* CPU */}
-      <div className="mb-4">
-        <div className="flex items-center justify-between mb-1.5">
-          <div className="flex items-center gap-2">
-            <Icon name="cpu" size={14} className="text-white/40" />
-            <span className="text-xs text-white/50">CPU</span>
-          </div>
-          <span className={`text-sm font-semibold tabular-nums ${getCpuColor(status.cpu)}`}>
-            {status.cpu.toFixed(0)}%
-          </span>
-        </div>
-        <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
-          <div
-            className={`h-full rounded-full transition-all duration-500 ${getCpuBg(status.cpu)}`}
-            style={{ width: `${Math.min(status.cpu, 100)}%` }}
-          />
-        </div>
-      </div>
-
-      {/* Memory */}
-      <div>
-        <div className="flex items-center justify-between mb-1.5">
-          <div className="flex items-center gap-2">
-            <Icon name="memory" size={14} className="text-white/40" />
-            <span className="text-xs text-white/50">{t('内存')}</span>
-          </div>
-          <span className={`text-sm font-semibold tabular-nums ${getMemoryColor(status.memory)}`}>
-            {status.memory.toFixed(0)}%
-          </span>
-        </div>
-        <div className="w-full h-1.5 bg-white/5 rounded-full overflow-hidden">
-          <div
-            className={`h-full rounded-full transition-all duration-500 ${getMemoryBg(status.memory)}`}
-            style={{ width: `${Math.min(status.memory, 100)}%` }}
-          />
-        </div>
-      </div>
-    </div>
-  )
-}
-
 // ==================== 主组件 ====================
 
 /**
@@ -362,7 +260,6 @@ function SystemStatusCard({ status }: { status: SystemStatus | null }) {
 function Home() {
   const navigate = useNavigate()
   const { plugins, loading: pluginsLoading } = usePlugins()
-  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null)
 
   // 过滤和排序已启用的插件（与侧边栏菜单保持一致）
   const enabledPlugins = useMemo(() => {
@@ -405,36 +302,6 @@ function Home() {
       ...normalPlugins.sort(sortNormalPlugins),
     ]
   }, [plugins])
-
-  // 加载系统状态
-  const loadSystemStatus = useCallback(async () => {
-    try {
-      const info = await SysInfoService.GetSystemInfo()
-      if (info) {
-        setSystemStatus({
-          cpu: info.cpuUsage || 0,
-          memory: info.memoryUsedPercent || 0,
-          uptime: info.hostUptime || '-'
-        })
-      }
-    } catch (_err) {
-      console.error('Failed to load system status:', _err)
-    }
-  }, [])
-
-  // 初始化加载系统状态
-  useEffect(() => {
-    loadSystemStatus()
-
-    // 监听系统信息更新
-    const unsub = Events.On('sysinfo:updated', () => {
-      loadSystemStatus()
-    })
-
-    return () => {
-      unsub?.()
-    }
-  }, [loadSystemStatus])
 
   // 点击插件卡片 - 导航到插件页面
   const handlePluginClick = (pluginId: string) => {
@@ -512,9 +379,6 @@ function Home() {
               plugins={enabledPlugins}
               onPluginClick={handlePluginClick}
             />
-
-            {/* 系统状态 */}
-            <SystemStatusCard status={systemStatus} />
           </div>
         </div>
       </div>

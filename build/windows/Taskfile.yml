@@ -32,7 +32,6 @@ tasks:
     internal: true
     deps:
       - task: common:go:mod:tidy
-      - task: common:install:lx-music-service:deps
       - task: common:build:frontend
         vars:
           BUILD_FLAGS:
@@ -115,8 +114,6 @@ tasks:
     cmds:
       # Create the Microsoft WebView2 bootstrapper if it doesn't exist
       - wails3 generate webview2bootstrapper -dir "{{.ROOT_DIR}}/build/windows/nsis"
-      # Prepare package directory with music service
-      - task: prepare:package
       # Build installer
       - |
         {{if eq OS "windows"}}
@@ -127,19 +124,6 @@ tasks:
     vars:
       ARCH: '{{.ARCH | default ARCH}}'
       ARG_FLAG: '{{if eq .ARCH "amd64"}}AMD64{{else}}ARM64{{end}}'
-
-  prepare:package:
-    summary: Prepares package directory with lx-music-service
-    internal: true
-    dir: build/windows/nsis
-    cmds:
-      - echo "Preparing package directory with lx-music-service..."
-      - |-
-        {{if eq OS "windows"}}
-        powershell -Command "if (Test-Path '{{.ROOT_DIR}}\lx-music-service') { Copy-Item -Path '{{.ROOT_DIR}}\lx-music-service' -Destination 'lx-music-service' -Recurse -Force }"
-        {{else}}
-        if [ -d "{{.ROOT_DIR}}/lx-music-service" ]; then cp -r "{{.ROOT_DIR}}/lx-music-service" ./; fi
-        {{end}}
 
   create:msix:package:
     summary: Creates an MSIX package
