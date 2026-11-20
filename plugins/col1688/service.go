@@ -214,6 +214,39 @@ func (s *Collect1688Service) OpenLogin() error {
 	return nil
 }
 
+// OpenSearch 打开（或导航已开的）1688 子窗口到"关键词 + 类别"搜索结果页。
+//
+// 方案 C：由 Go 代搜——把关键词/类别拼成 1688 站内搜索 URL 直接 SetURL 到子窗口，
+// 避免用户手敲搜索框触发跨域表单提交（login.1688.com）→ WebView2 COM 层冒新窗口。
+// keyword 为空时到 1688 首页（供先登录）。category：factory/supplier/industry/offer。
+func (s *Collect1688Service) OpenSearch(keyword, category string) error {
+	err := s.engine.OpenSearch(context.Background(), keyword, category)
+	if err != nil {
+		s.logf("打开搜索页失败：" + err.Error())
+		return err
+	}
+	if keyword != "" {
+		s.logf(fmt.Sprintf("已打开搜索页：%s（%s）", keyword, categoryOrDefault(category)))
+	} else {
+		s.logf("子窗口已打开 1688 首页（未带关键词，可先登录）")
+	}
+	return nil
+}
+
+// categoryOrDefault 返回类别的中文标签（日志用），未知回退 offer。
+func categoryOrDefault(c string) string {
+	switch c {
+	case "factory":
+		return "找工厂"
+	case "supplier":
+		return "找供应商"
+	case "industry":
+		return "行业"
+	default:
+		return "找货源"
+	}
+}
+
 // CloseLogin 关闭 1688 子窗口。
 func (s *Collect1688Service) CloseLogin() {
 	s.engine.CloseLogin()

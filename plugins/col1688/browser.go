@@ -275,6 +275,20 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 	return nil
 }
 
+// OpenSearch 打开子窗口到"关键词 + 类别"对应的 1688 搜索结果页。
+//
+// 方案 C（绕开搜索框跨域冒窗）：由 Go 端把关键词/类别拼成 1688 站内搜索 URL，
+// 直接 SetURL 到子窗口——**整页在子窗口内加载，不触发 WebView2 COM 层 NewWindowRequested**，
+// 从而避免"用户手敲搜索框 → 表单跨域提交到 login.1688.com → 冒新窗"的最大触发源。
+// keyword 为空时回退到 1688 首页（供登录）。category 取值：factory/supplier/industry/offer。
+func (e *windowEngine) OpenSearch(ctx context.Context, keyword, category string) error {
+	url := ""
+	if keyword != "" {
+		url = e.searchURL(CollectOptions{Keyword: keyword, Category: category})
+	}
+	return e.OpenWindow(ctx, url)
+}
+
 // startBridgeLoop 启动 installBridge 持久注入循环（幂等：已在跑则不重复 spawn）。
 func (e *windowEngine) startBridgeLoop() {
 	e.bridgeMu.Lock()
