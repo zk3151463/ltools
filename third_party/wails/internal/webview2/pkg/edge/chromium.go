@@ -76,12 +76,6 @@ type Chromium struct {
 	processFailed                    *ICoreWebView2ProcessFailedEventHandler
 	newWindowRequested               *ICoreWebView2NewWindowRequestedEventHandler
 
-	// evalDoneCh 是 EvalWithResult 的"COM 回调完成"信号，由主线程消息泵派发回调时 close。
-	// EvalWithResult 在主线程内用独立 goroutine 轮询它（回调能在当前消息泵循环里派发，
-	// 主线程不被等待卡住 → 不重演"InvokeSync 占主线程 → COM 回调永不派发"死锁）。
-	// 每个 EvalWithResult 调用前重建。
-	evalDoneCh chan struct{}
-
 	environment            *ICoreWebView2Environment
 	webview2RuntimeVersion string
 	compositionHost        *compositionHost
@@ -470,20 +464,21 @@ func (e *Chromium) Eval(script string) {
 // handler=nil 读不回结果）。JS 必须是"返回一个可 JSON 序列化值"的表达式（如
 // JSON.stringify(...)），结果经 handler 回调里的 GetResultAsJson 读回。
 //
-// 实现要点：
-//   - COM handler（iCoreWebView2ExecuteScriptWithResultCompletedHandler）放堆上 +
-//     sync.WaitGroup 等待，与 Wails 现有所有 CompletedHandler 同一模式（NewComProc =
-//     windows.NewCallback，handlerAddRef/handlerRelease 记账，见 com_refs.go）。
-//   - 超时：WebView2 卡住时不无限等，返回 ("", ErrEvalTimeout)。
-//   - 回调在 WebView2 的 UI 线程跑；Go 侧在独立 goroutine 里 wg.Wait（不阻塞调用线程的
-//     COM 消息泵），waiter goroutine 的 select 超时返回后不再引用 handler，后续迟到的
-//     回调只跑 wg.Done()（wg 计数归零后是 no-op），无数据竞争。
+// 线程模型（关键，根治死锁）：
+//   - 调用方必须在**主线程**里调用本方法（execJSResult 经 InvokeSync 派发到主线程）。
+//   - COM 完成回调经 windows.NewCallback（非 purego）注册，由 WebView2 在自己的 UI 线程
+//     **同步**调用 Go 函数（不经 Wails 主线程消息泵）；回调里 close(e.evalDoneCh)。
+//   - 若主线程在提交后阻塞等待（select / time.After / 10ms 轮询），主线程消息泵停转，
+//     且回调虽能 close channel 但调用方已被阻塞 → 死锁/超时。
+//   - 因此 EvalWithResult **不阻塞主线程**：提交 ExecuteScriptWithResult 后立即返回结果
+//     channel；主线程调用方（execJSResult）把 channel 交回给**非主线程**的调用者
+//     （public ExecJSResult）阻塞读取。COM 回调随时 close channel，非主线程读取即得结果。
 //
-// 返回 (result string, err error)：
-//   - 成功：result = JS 表达式的 JSON 字符串（如 "1" / "[{...}]" / "null"），err = nil
-//   - JS 抛异常 / Succeeded=false：result = ""，err = 非 nil（业务侧据此区分"没数据"与"出错"）
-//   - 超时：result = ""，err = ErrEvalTimeout
-//   - 窗口未就绪 / shuttingDown：result = ""，err = 非 nil
+// 返回的 channel 只发送一次（成功 / JS 失败 / 超时三选一），随后关闭。
+//   - 成功：{res: JSON 字符串, err: nil}
+//   - JS 抛异常 / Succeeded=false：{res: "", err: 非 nil}
+//   - 超时：{res: "", err: ErrEvalTimeout}
+//   - 提交失败（窗口未就绪 / ICoreWebView2_21 不支持）：{res: "", err: 非 nil}
 var ErrEvalTimeout = errors.New("EvalWithResult: timeout")
 
 // evalWithResultHandler 实现 iCoreWebView2ExecuteScriptWithResultCompletedHandlerImpl。
@@ -491,17 +486,18 @@ var ErrEvalTimeout = errors.New("EvalWithResult: timeout")
 // 放堆上；生命周期由 handlerAddRef 记账（COM Release 前不被 GC，同 Wails 现有 CompletedHandler 模式，
 // 见 com_refs.go）。
 //
-// done 必须是主线程消息泵上的 channel（见 Chromium.evalDoneCh）：COM 回调在 Wails 主线程
-// 的消息泵里派发，close(done) 不阻塞主线程；EvalWithResult 在主线程内用独立 goroutine 轮询它。
+// done 是完成信号 channel（EvalWithResult 的局部 doneCh）：COM 回调（WebView2 UI 线程
+// 同步调 Go）close 它；非主线程的等待 goroutine 收到即把结果送入 result channel。主线程不被阻塞。
 type evalWithResultHandler struct {
-	out  *evalResult
+	out  *EvalResult
 	done chan struct{}
 }
 
-// evalResult 承载一次 EvalWithResult 的结果，由 COM 回调写入、EvalWithResult 在 done 关闭后读。
-type evalResult struct {
-	res string
-	err error
+// EvalResult 承载一次 EvalWithResult 的结果，由 COM 回调写入、等待 goroutine 在 done 关闭后
+// 送入结果 channel。导出供 pkg/application 的 execJSResult 读取。
+type EvalResult struct {
+	Res string
+	Err error
 }
 
 func (h *evalWithResultHandler) QueryInterface(_ uintptr, object uintptr) uintptr {
@@ -513,7 +509,7 @@ func (h *evalWithResultHandler) QueryInterface(_ uintptr, object uintptr) uintpt
 func (h *evalWithResultHandler) ExecuteScriptWithResultCompleted(errorCode uintptr, result *iCoreWebView2ExecuteScriptResult) uintptr {
 	defer close(h.done)
 	if int32(errorCode) < 0 || result == nil {
-		h.out.err = fmt.Errorf("ExecuteScriptWithResult completed with HRESULT 0x%08x", uint32(errorCode))
+		h.out.Err = fmt.Errorf("ExecuteScriptWithResult completed with HRESULT 0x%08x", uint32(errorCode))
 		return 0
 	}
 	succeeded, _ := result.GetSucceeded()
@@ -525,84 +521,94 @@ func (h *evalWithResultHandler) ExecuteScriptWithResultCompleted(errorCode uintp
 				msg = fmt.Sprintf("（line %d）", line)
 			}
 		}
-		h.out.err = fmt.Errorf("JS 执行失败%s", msg)
+		h.out.Err = fmt.Errorf("JS 执行失败%s", msg)
 		return 0
 	}
 	jsonStr, err := result.GetResultAsJson()
 	if err != nil {
 		// 退化：TryGetResultAsString（JS 结果是原始 string 时可直接读回）
 		if s, ok, serr := result.TryGetResultAsString(); serr == nil && ok {
-			h.out.res = s
+			h.out.Res = s
 			return 0
 		}
-		h.out.err = err
+		h.out.Err = err
 		return 0
 	}
-	h.out.res = jsonStr
+	h.out.Res = jsonStr
 	return 0
 }
 
-// EvalWithResult 执行 JS 并同步读回结果（JSON 字符串）。
-// 调用方必须保证：同窗口同一时刻只有一个 EvalWithResult 在飞（col1688 的单窗口串行调用满足）。
+// EvalWithResult 执行 JS 并提交**异步读回**（返回结果 channel，非阻塞）。
 //
-// 线程模型（关键）：本方法在 **Wails 主线程** 里被调用（execJSResult 经
-// InvokeSync → dispatchOnMainThread 派发到主线程）。COM 回调也只能在主线程消息泵里派发。
-// 若"提交 COM 回调后让出主线程等 wg"（即 `go wg.Wait()` 然后 select 阻塞），主线程会被
-// 占住、消息泵停转 → 回调永不派发 → 必超时。所以这里用"主线程内独立 goroutine 轮询
-// evalDoneCh"：COM 回调由当前消息泵循环派发（主线程不被等待卡住），轮询 goroutine
-// （非主线程）读到 done 即返回结果；主线程内 time.After(timeout) 兜底超时。
-func (e *Chromium) EvalWithResult(script string, timeout time.Duration) (string, error) {
-	if e.webview == nil || e.shuttingDown {
-		return "", errors.New("webview not initialized or shutting down")
-	}
+// 调用方必须在 **Wails 主线程** 里调用本方法（execJSResult 经 InvokeSync 派发到主线程）。
+// 本方法只提交 COM 调用 + 启动等待 goroutine，**立即返回结果 channel**，绝不阻塞主线程。
+// 主线程调用方（execJSResult）拿到 channel 后交给**非主线程**的 public ExecJSResult 阻塞
+// 读取——此时主线程消息泵继续转，COM 完成回调随时 close evalDoneCh，等待 goroutine 把结果
+// 送入 channel。
+//
+// 调用方必须保证：同窗口同一时刻只有一个 EvalWithResult 在飞（col1688 的单窗口串行调用满足）。
+// 返回的 channel 只发送一次（成功 / JS 失败 / 超时三选一），随后关闭。
+func (e *Chromium) EvalWithResult(script string, timeout time.Duration) chan EvalResult {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
+	}
+	// 结果 channel（容量 1，保证等待 goroutine 能发出不阻塞）。
+	result := make(chan EvalResult, 1)
+
+	if e.webview == nil || e.shuttingDown {
+		// 窗口未就绪：直接返回错误结果，不等超时。
+		result <- EvalResult{Err: errors.New("webview not initialized or shutting down")}
+		close(result)
+		return result
 	}
 	// ICoreWebView2_21 接口（ExecuteScriptWithResult 在它上面）。
 	// 老版 WebView2 运行时 QueryInterface 失败 → 回退 Eval（fire-and-forget，读不回结果）。
 	wv21 := e.webview.GetICoreWebView2_21()
 	if wv21 == nil {
 		e.Eval(script)
-		return "", errors.New("WebView2 ICoreWebView2_21 not supported (old runtime); fell back to Eval")
+		result <- EvalResult{Err: errors.New("WebView2 ICoreWebView2_21 not supported (old runtime); fell back to Eval")}
+		close(result)
+		return result
 	}
-	defer wv21.Release()
 
-	// 重建完成信号 channel（每个调用独立；COM 回调在消息泵里 close 它）。
-	e.evalDoneCh = make(chan struct{})
+	// 重建完成信号 channel（每个调用独立；COM 回调 close 它）。
+	doneCh := make(chan struct{})
 
 	// handler 放堆上（vtbl 指向包级静态 vtbl，impl 是 &handler 自身）；
 	// handlerAddRef 记账保证 COM Release 前不被 GC（同 Wails 现有 handler 模式）。
-	out := &evalResult{}
-	impl := &evalWithResultHandler{out: out, done: e.evalDoneCh}
+	out := &EvalResult{}
+	impl := &evalWithResultHandler{out: out, done: doneCh}
 	handler := newICoreWebView2ExecuteScriptWithResultCompletedHandler(impl)
 	handlerAddRef(unsafe.Pointer(handler))
-	defer handlerRelease(unsafe.Pointer(handler))
 
 	err := wv21.ExecuteScriptWithResult(script, handler)
 	if err != nil {
-		close(e.evalDoneCh) // 回调不会来了（close 是幂等的，回调 close 时已关则此处 no-op）
-		return "", fmt.Errorf("ExecuteScriptWithResult: %w", err)
+		// 提交失败：回调不会来了，立刻释放 handler 并返回错误。
+		handlerRelease(unsafe.Pointer(handler))
+		wv21.Release()
+		result <- EvalResult{Err: fmt.Errorf("ExecuteScriptWithResult: %w", err)}
+		close(result)
+		return result
 	}
+	wv21.Release()
 
-	// 主线程内等待：独立 goroutine 轮询 evalDoneCh（COM 回调在当前消息泵循环里派发并 close）。
-	// 轮询间隔 10ms（COM 派发延迟小，足够及时）；主线程的 time.After(timeout) 兜底。
-	result := make(chan evalResult, 1)
+	// 非主线程等待：COM 回调 close(doneCh) 或超时，二者先到者发送结果。
+	// handler 的生命周期：等待 goroutine 完成（收到结果或超时）后才 handlerRelease，
+	// 避免迟到的 COM 回调访问已回收的 handler。
 	go func() {
-		for {
-			select {
-			case <-e.evalDoneCh:
-				result <- *out
-				return
-			case <-time.After(10 * time.Millisecond):
-			}
+		defer handlerRelease(unsafe.Pointer(handler))
+		select {
+		case <-doneCh:
+			// COM 回调已把结果写入 out。
+			result <- *out
+		case <-time.After(timeout):
+			result <- EvalResult{Err: ErrEvalTimeout}
+			// 超时后 COM 回调可能稍后才 close(doneCh)；doneCh 是独立局部变量，
+			// 无数据竞争；迟到的回调会尝试写入 out（已无人读，安全 no-op）。
 		}
+		close(result)
 	}()
-	select {
-	case r := <-result:
-		return r.res, r.err
-	case <-time.After(timeout):
-		return "", ErrEvalTimeout
-	}
+	return result
 }
 
 func (e *Chromium) Show() error {

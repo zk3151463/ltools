@@ -1198,7 +1198,8 @@ func (e *windowEngine) collectItems(ctx context.Context) []Supplier {
 	items, uerr := unmarshalSuppliers(out)
 	if len(items) == 0 && (err != nil || uerr != nil) {
 		if e.logf != nil {
-			e.logf("[ExecJSResult] 首次读回空/失败，800ms 后重试一次（等 JS 上下文就绪）")
+			e.logf(fmt.Sprintf("[ExecJSResult] 首次读回空/失败（err=%v uerr=%v raw=%s），800ms 后重试一次",
+				err, uerr, truncateStr(out, 120)))
 		}
 		time.Sleep(800 * time.Millisecond)
 		w.ExecJS(suppliersJS)
@@ -1207,15 +1208,23 @@ func (e *windowEngine) collectItems(ctx context.Context) []Supplier {
 	}
 	if err != nil {
 		if e.logf != nil {
-			e.logf(fmt.Sprintf("[ExecJSResult] 读回供应商数据失败：%v", err))
+			// 诊断：区分三种根因
+			// ① "ICoreWebView2_21 not supported" → 老 WebView2 运行时（QueryInterface 失败）
+			// ② "EvalWithResult: timeout" → COM 回调线程模型问题（死锁/未派发）
+			// ③ 其它 → 提交失败 / JS 执行异常
+			e.logf(fmt.Sprintf("[ExecJSResult] 读回供应商数据失败（根因诊断）：%v", err))
 		}
 		return nil
 	}
 	if uerr != nil {
 		if e.logf != nil {
-			e.logf(fmt.Sprintf("[ExecJSResult] 解析供应商 JSON 失败：%v（raw=%s）", uerr, truncateStr(out, 200)))
+			e.logf(fmt.Sprintf("[ExecJSResult] 解析供应商 JSON 失败（根因③：suppliersJS 没跑成功）：%v（raw=%s）",
+				uerr, truncateStr(out, 200)))
 		}
 		return nil
+	}
+	if e.logf != nil {
+		e.logf(fmt.Sprintf("[ExecJSResult] 读回 %d 条供应商", len(items)))
 	}
 	return items
 }
@@ -1487,26 +1496,25 @@ func (e *windowEngine) SetURL(ctx context.Context, url string) bool {
 }
 
 // DumpPageHTML 把子窗口当前页 HTML 落盘到 diagDir（诊断用），返回文件路径。
+// 走 ExecJSResult（COM 同步读回 document.documentElement.outerHTML），不依赖 127.0.0.1 HTTP
+// 回传（外部 1688 页 fetch 被风控拦 → 老路径必超时）。
 func (e *windowEngine) DumpPageHTML(tag string) string {
 	w, ok := e.currentWindow()
 	if !ok || e.diagDir == "" {
 		return ""
 	}
-	e.drainChannel()
-	w.ExecJS(`if (window.__ltoolsCollect) window.__ltoolsCollect();`)
-	select {
-	case p := <-e.pageHTMLCh:
-		if p.HTML == "" {
-			return ""
+	html, err := w.ExecJSResult(`document.documentElement.outerHTML || ""`, 10*time.Second)
+	if err != nil || html == "" {
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[DumpPageHTML] ExecJSResult 读回 HTML 失败：%v", err))
 		}
-		_ = os.MkdirAll(e.diagDir, 0o755)
-		name := fmt.Sprintf("page_%s_%s.html", tag, time.Now().Format("20060102_150405"))
-		path := filepath.Join(e.diagDir, name)
-		if err := os.WriteFile(path, []byte(p.HTML), 0o644); err != nil {
-			return ""
-		}
-		return path
-	case <-time.After(5 * time.Second):
 		return ""
 	}
+	_ = os.MkdirAll(e.diagDir, 0o755)
+	name := fmt.Sprintf("page_%s_%s.html", tag, time.Now().Format("20060102_150405"))
+	path := filepath.Join(e.diagDir, name)
+	if err := os.WriteFile(path, []byte(html), 0o644); err != nil {
+		return ""
+	}
+	return path
 }

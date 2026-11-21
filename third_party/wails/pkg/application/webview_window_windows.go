@@ -454,17 +454,34 @@ func (w *windowsWebviewWindow) execJS(js string) {
 
 // execJSResult runs js and reads back its JSON result synchronously (up to
 // timeout). Delegates to chromium.EvalWithResult (ICoreWebView2_21
-// .ExecuteScriptWithResult COM callback). Runs on the main thread, like execJS.
+// .ExecuteScriptWithResult COM callback).
+//
+// 线程模型（根治死锁）：EvalWithResult 必须在主线程提交（COM 调用），但**等待结果
+// 不能在主线程阻塞**——否则主线程消息泵停转，COM 完成回调永不派发 → 必超时。
+// 所以这里 dispatchOnMainThread 只"提交 + 拿 channel"（主线程立即返回），然后由
+// 非主线程的调用者（public ExecJSResult）阻塞读取 channel。主线程消息泵继续转，
+// COM 回调随时 close doneCh，等待 goroutine 把结果送入 channel。
+// execJSResult 提交 EvalWithResult（COM 调用）并在主线程内读取结果。
+// 注意：主线程内直接读 channel 会死锁（主线程被占住 → COM 回调永不派发）。
+// 故 windows 平台的 public ExecJSResult 走"主线程 submit + 非主线程 read"两段式
+// （见 webview_window.go 的 ExecJSResult），不在主线程内阻塞读 channel。
+// 本方法仅供 server / 非 windows 等"调用者不在主线程"的场景走同步读。
 func (w *windowsWebviewWindow) execJSResult(js string, timeout time.Duration) (string, error) {
+	res := <-w.execJSResultSubmit(js, timeout)
+	return res.Res, res.Err
+}
+
+// execJSResultSubmit 非阻塞提交：主线程内调用时提交 COM 调用（EvalWithResult）并立即
+// 返回结果 channel。COM 完成回调随时 close doneCh，等待 goroutine 把结果送入 channel；
+// 主线程消息泵继续转。channel 由非主线程的调用者（public ExecJSResult）阻塞读取。
+func (w *windowsWebviewWindow) execJSResultSubmit(js string, timeout time.Duration) chan edge.EvalResult {
 	if w.chromium == nil {
-		return "", fmt.Errorf("webview not initialized")
+		ch := make(chan edge.EvalResult, 1)
+		ch <- edge.EvalResult{Err: fmt.Errorf("webview not initialized")}
+		close(ch)
+		return ch
 	}
-	var out string
-	var outErr error
-	globalApplication.dispatchOnMainThread(func() {
-		out, outErr = w.chromium.EvalWithResult(js, timeout)
-	})
-	return out, outErr
+	return w.chromium.EvalWithResult(js, timeout)
 }
 
 func (w *windowsWebviewWindow) setBackgroundColour(color RGBA) {

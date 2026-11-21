@@ -14,6 +14,7 @@ import (
 	"github.com/wailsapp/wails/v3/internal/assetserver"
 	"github.com/wailsapp/wails/v3/internal/optional"
 	"github.com/wailsapp/wails/v3/pkg/events"
+	edge "github.com/wailsapp/wails/v3/internal/webview2/pkg/edge"
 )
 
 // Enabled means the feature should be enabled
@@ -734,19 +735,41 @@ func (w *WebviewWindow) ExecJSResult(js string, timeout time.Duration) (string, 
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	var out string
-	var outErr error
 	w.pendingJSMutex.Lock()
-	if w.runtimeLoaded {
-		w.pendingJSMutex.Unlock()
-		InvokeSync(func() {
-			out, outErr = w.impl.execJSResult(js, timeout)
-		})
-	} else {
+	if !w.runtimeLoaded {
 		w.pendingJSMutex.Unlock()
 		// Runtime not loaded yet — cannot read a result synchronously.
 		return "", fmt.Errorf("webview runtime not loaded")
 	}
+	w.pendingJSMutex.Unlock()
+
+	// 两段式（根治死锁）：
+	//  1) 主线程内提交 COM 调用（dispatchOnMainThread 非阻塞拿到结果 channel）。
+	//  2) 非主线程（调用者）阻塞读取 channel。主线程消息泵继续转，COM 完成回调随时
+	//     close doneCh，等待 goroutine 把结果送入 channel → 不死锁。
+	//
+	// windows 平台的 impl 走 execJSResultSubmit（非阻塞提交）；其它平台（server 等）走
+	// execJSResult（同步读，调用者本就不在主线程，无死锁风险）。
+	type resultCher interface {
+		execJSResultSubmit(js string, timeout time.Duration) chan edge.EvalResult
+	}
+	if rc, ok := w.impl.(resultCher); ok {
+		var resultCh chan edge.EvalResult
+		InvokeSync(func() {
+			resultCh = rc.execJSResultSubmit(js, timeout)
+		})
+		if resultCh == nil {
+			return "", fmt.Errorf("webview not initialized")
+		}
+		res := <-resultCh
+		return res.Res, res.Err
+	}
+	// 非 windows 平台（server 等）：同步读取（调用者不在主线程，无死锁）。
+	var out string
+	var outErr error
+	InvokeSync(func() {
+		out, outErr = w.impl.execJSResult(js, timeout)
+	})
 	return out, outErr
 }
 
