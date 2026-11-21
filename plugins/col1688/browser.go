@@ -196,16 +196,37 @@ func (e *windowEngine) handleRawMessage(message string) {
 	if e.logf != nil {
 		e.logf(fmt.Sprintf("[RawMsg] 收到 raw message（len=%d）：%s", len(message), truncateStr(message, 200)))
 	}
-	// 快速过滤：消息必须是 JSON 对象且含 "url" 或 "items" 或 "html" 字段
-	// （window.external.invoke 发的 c1688:page-html payload）
+	// 快速过滤：消息必须是 JSON 对象
 	if !strings.HasPrefix(message, "{") {
 		return
 	}
+	// 先解析 type 字段（区分 c1688:connected 和 page-html payload）
+	var msg struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(message), &msg); err != nil {
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[RawMsg] JSON 解析失败：%v（raw=%s）", err, truncateStr(message, 100)))
+		}
+		return
+	}
+	// c1688:connected：子窗口页面加载后发来的连接确认
+	if msg.Type == "c1688:connected" {
+		var c struct {
+			URL string `json:"url"`
+		}
+		_ = json.Unmarshal([]byte(message), &c)
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[连接] 子窗口已连接 via window.external.invoke（url=%s）", c.URL))
+		}
+		return
+	}
+	// 无 type 字段或 type 为空 → 当作 page-html payload 处理
 	var p pageHTMLPayload
 	if err := json.Unmarshal([]byte(message), &p); err != nil {
 		// 不是本插件的消息（可能是其他窗口的 raw message），忽略
 		if e.logf != nil {
-			e.logf(fmt.Sprintf("[RawMsg] JSON 解析失败：%v（raw=%s）", err, truncateStr(message, 100)))
+			e.logf(fmt.Sprintf("[RawMsg] page-html 解析失败：%v（raw=%s）", err, truncateStr(message, 100)))
 		}
 		return
 	}
@@ -706,6 +727,21 @@ const bridgeJS = `
   // ---- 幂等：本文档已装则直接返回 ----
   if (window.__ltoolsBridgeInstalled) return;
   window.__ltoolsBridgeInstalled = true;
+
+  // ---- 0. 连接确认：页面加载后立即发 c1688:connected 到 Go 端 ----
+  // 用 window.__ltoolsConnected 防同一文档内重复发（install 循环 80ms 重注）。
+  // 每次整页导航后新文档 JS 上下文重置，__ltoolsConnected 消失 → 重新发。
+  // 这是打通 window.external.invoke 通道的最小测试：不依赖采集流程。
+  if (!window.__ltoolsConnected && window.external && window.external.invoke) {
+    window.__ltoolsConnected = true;
+    try {
+      window.external.invoke(JSON.stringify({
+        type: 'c1688:connected',
+        url: location.href,
+        ts: Date.now()
+      }));
+    } catch (e) {}
+  }
 
   // ---- 1. 数据回传 ----
   // 外部 1688 页没有 window.ltools（Wails 不注入外部站），且 ExecJS 是 void 读不回结果。
