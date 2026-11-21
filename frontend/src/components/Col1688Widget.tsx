@@ -44,6 +44,9 @@ export function Col1688Widget() {
   const [autoRunning, setAutoRunning] = useState(false)
   const [pages, setPages] = useState(3)
   const [delaySec, setDelaySec] = useState(2)
+  const [detailOpen, setDetailOpen] = useState(false)
+  const [detailEnabled, setDetailEnabled] = useState(false)
+  const [detailPerPage, setDetailPerPage] = useState(5)
 
   const logRef = useRef<HTMLDivElement>(null)
   const runningRef = useRef(false)
@@ -115,6 +118,22 @@ export function Col1688Widget() {
     info(t('已关闭 1688 子窗口'))
   }
 
+  const handleOpenDetail = async () => {
+    try {
+      await Col1688Service.OpenDetailWindow()
+      setDetailOpen(true)
+      success(t('已打开详情窗（1688 首页，首登用；登录态持久）'))
+    } catch (e: any) {
+      showError(t('打开详情窗失败：') + String(e))
+    }
+  }
+
+  const handleCloseDetail = () => {
+    Col1688Service.CloseDetailWindow()
+    setDetailOpen(false)
+    info(t('已关闭详情窗'))
+  }
+
   const handleCollect = async () => {
     if (collecting) return
     if (!windowOpen) {
@@ -146,7 +165,18 @@ export function Col1688Widget() {
     if (autoRunning) return
     setAutoRunning(true)
     try {
-      await Col1688Service.StartPages({ Pages: pages, DelaySec: delaySec, Mode: 'browser', Keyword: '', Category: 'factory', Region: '', MaxCount: 0, HTML: '' })
+      await Col1688Service.StartPages({
+        Pages: pages,
+        DelaySec: delaySec,
+        Mode: 'browser',
+        Keyword: '',
+        Category: 'factory',
+        Region: '',
+        MaxCount: 0,
+        HTML: '',
+        DetailEnabled: detailEnabled,
+        DetailPerPage: detailPerPage,
+      })
       success(t('已启动自动采集 ' + pages + ' 页，可在子窗口里手动干预（暂停用「停止」）'))
     } catch (e: any) {
       showError(t('启动自动采集失败：') + String(e))
@@ -265,6 +295,12 @@ export function Col1688Widget() {
               <CtrlBtn onClick={handleDumpDiagnosis} icon="camera" disabled={!windowOpen || collecting || autoRunning}>
                 {t('导出诊断')}
               </CtrlBtn>
+              <CtrlBtn onClick={handleOpenDetail} icon="external-link" disabled={autoRunning} accent>
+                {detailOpen ? t('已打开详情窗') : t('打开详情窗(首登)')}
+              </CtrlBtn>
+              <CtrlBtn onClick={handleCloseDetail} icon="close" disabled={!detailOpen || autoRunning}>
+                {t('关闭详情窗')}
+              </CtrlBtn>
               <CtrlBtn onClick={handleExport} icon="download" disabled={results.length === 0}>
                 {t('导出 CSV')}
               </CtrlBtn>
@@ -299,6 +335,31 @@ export function Col1688Widget() {
                   className="w-14 px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white text-xs focus:outline-none focus:border-[#A78BFA] disabled:opacity-40"
                 />
               </label>
+              <label className="flex items-center gap-2 text-xs text-white/50">
+                {t('每页详情数')}
+                <input
+                  type="number"
+                  min={0}
+                  max={10}
+                  value={detailPerPage}
+                  onChange={e => setDetailPerPage(Math.max(0, Math.min(10, Number(e.target.value) || 0)))}
+                  disabled={autoRunning}
+                  title={t('0 = 不访问详情；上限 10。未勾选「开详情窗」时本项无效。')}
+                  className="w-14 px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white text-xs focus:outline-none focus:border-[#A78BFA] disabled:opacity-40"
+                />
+              </label>
+              <label className="flex items-center gap-2 text-xs text-white/50 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={detailEnabled}
+                  onChange={e => setDetailEnabled(e.target.checked)}
+                  disabled={autoRunning}
+                  className="w-4 h-4 accent-[#A78BFA] disabled:opacity-40"
+                />
+                {t('开详情窗补电话')}
+              </label>
+            </div>
+            <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-2">
               <CtrlBtn onClick={handleAutoCollect} icon="play" disabled={!windowOpen || autoRunning || collecting} accent className="sm:col-span-2">
                 {autoRunning ? t('自动采集中…') : t('自动采集 ' + pages + ' 页')}
               </CtrlBtn>
@@ -306,6 +367,11 @@ export function Col1688Widget() {
                 {t('停止')}
               </CtrlBtn>
             </div>
+            {detailEnabled && !detailOpen && (
+              <div className="mt-2 text-[11px] text-[#FBBF24]">
+                {t('已勾选「开详情窗补电话」但详情窗未打开；自动采集启动时会先自动开详情窗。首次使用请先在详情窗里手动登录 1688。')}
+              </div>
+            )}
             {exportPath && (
               <div className="text-[11px] text-[#A78BFA] mt-3 truncate">
                 {t('最近导出：')}<span className="text-white/50 font-mono">{exportPath}</span>

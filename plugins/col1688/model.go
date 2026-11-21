@@ -45,6 +45,10 @@ type CollectOptions struct {
 	DelaySec int
 	// HTML html 模式下粘贴的页面内容
 	HTML string
+	// DetailEnabled 是否在自动多页采集时打开详情窗补电话（true=补，false=跳过）
+	DetailEnabled bool
+	// DetailPerPage 每页最多访问几个详情页（补电话用，0=默认 5，上限 10）
+	DetailPerPage int
 }
 
 // CollectResult 采集结果。

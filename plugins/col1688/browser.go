@@ -74,8 +74,11 @@ type pageHTMLPayload struct {
 	Items []Supplier `json:"items"`
 }
 
-func newWindowEngine(app *application.App, diagDir string) *windowEngine {
-	return &windowEngine{
+// newWindowEngine 创建一个 Wails 子窗口引擎。
+//   - htmlServerOwned：true → 该 engine 自己启动/持有 127.0.0.1:48217 回传服务（列表引擎）。
+//   - false → 直接复用已存在的回传服务（详情引擎，端口已监听则跳过启动）。
+func newWindowEngine(app *application.App, diagDir string, htmlServerOwned bool) *windowEngine {
+	e := &windowEngine{
 		app:        app,
 		name:       "c1688-window",
 		diagDir:    diagDir,
@@ -83,6 +86,20 @@ func newWindowEngine(app *application.App, diagDir string) *windowEngine {
 		bridgeStop: make(chan struct{}),
 		collectReq: make(chan pageHTMLPayload, 4),
 	}
+	if htmlServerOwned {
+		e.startHTMLReturn()
+	}
+	return e
+}
+
+// newDetailWindowEngine 创建详情页子窗口引擎（第二个窗口）。
+// 不启动回传服务（列表引擎已起 127.0.0.1:48217），仅共享同一台服务。
+// 独立引擎 = 独立窗口 + 独立 bridge 注入循环。风控上"详情窗被拒可单独关窗重开"，
+// 列表窗信任度不受影响。
+func newDetailWindowEngine(app *application.App, diagDir string) *windowEngine {
+	e := newWindowEngine(app, diagDir, false)
+	e.name = "c1688-detail-window"
+	return e
 }
 
 // registerEvents 在 app 启动后调用，注册 c1688:page-html 事件监听。
@@ -132,12 +149,12 @@ func (e *windowEngine) registerEvents() {
 }
 
 // htmlReturnPort 子窗口回传 HTML 的固定本地回环端口。
-// 固定端口便于 bridgeJS 硬编码；被占用时 startHTMLReturn 会报错并记日志（不影响主流程，
-// 采集退化为"无数据"，前端仍可用 html 粘贴模式降级）。
+// 固定端口便于 bridgeJS 硬编码；被占用时 startHTMLReturn 会记日志（详情引擎复用时属正常）。
 const htmlReturnPort = 48217
 
 // startHTMLReturn 启动本地回环 HTTP 服务，接收子窗口 fetch POST 的 HTML。
-// 在 engine 创建时（NewCollect1688Service）调用一次。
+// 列表引擎启动一次；详情引擎复用同一服务（端口已被占用时 logf 不报"失败"，静默跳过）。
+// 幂等：e.htmlServer 非 nil 直接返回。
 //
 // 通道原理（外部页 → Go 的唯一稳健路）：
 //   - 1688 子窗口是 https 外部页，Wails 不注入 window.ltools，ExecJS 又是 void。
@@ -155,8 +172,11 @@ func (e *windowEngine) startHTMLReturn() {
 	}
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", htmlReturnPort))
 	if err != nil {
+		// 判断"被占用"：Listen 失败且消息含 "address already in use"（Windows 下 net.Error 的 Timeout 为 false，Err 为 syscall）。
+		// 不精确匹配，改为"启动失败但端口已监听过（e.htmlServer 已被外部置位）时静默"——简化：
+		// 让调用方（详情引擎）在调用前先检查端口。这里统一报错。
 		if e.logf != nil {
-			e.logf("HTML 回传端口 " + fmt.Sprintf("%d", htmlReturnPort) + " 启动失败：" + err.Error() + "（采集将无数据，可用粘贴 HTML 模式）")
+			e.logf("HTML 回传端口 " + fmt.Sprintf("%d", htmlReturnPort) + " 启动失败：" + err.Error() + "（若列表引擎已起过本服务则属正常复用）")
 		}
 		return
 	}
@@ -779,9 +799,74 @@ const suppliersJS = `
     return out;
   }
 
+  // ---- 0. 1688 结果页专用（真实页面结构：window.data.offerresultData / 哈希 css-modules 类）----
+  // 命中条件：window.data 存在（1688 搜索结果页）；从 window.data 递归找供应商数组。
+  // 1688 结果页卡片没有电话（只有店名/地址/店铺 URL），电话列留空是预期；
+  // 若要电话，需走详情页（见 service.go 的双窗编排：detail 窗口逐个访问 item.Url）。
+  function from1688Result(){
+    var out=[]; var seen={};
+    var NAME_KEYS=["shopName","companyName","companyNameStr","sellerName","loginId","memberId","name"];
+    var ADDR_KEYS=["province","provinceName","city","cityName","town","townName","address","fullAddress","areaName","addressDetail"];
+    var URL_KEYS=["shopUrl","winportUrl","companyUrl","url","link","offerUrl"];
+    function pushItem(name, phone, address, main, level, shopUrl){
+      name=normName(name); phone=normPhone(phone);
+      address=address||""; main=main||""; level=level||""; shopUrl=shopUrl||"";
+      var key=name+"||"+address+"||"+shopUrl;
+      if(!key || key==="||") return;
+      if(seen[key]) return;
+      seen[key]=1;
+      out.push({name:name,phone:phone,address:address,main:main,level:level,url:shopUrl});
+    }
+    // 递归找 window.data 里"含 NAME_KEYS 的项"
+    var dataObj = (typeof window.data === "object" && window.data) ? window.data : null;
+    if(dataObj){
+      var walk=function(v, depth){
+        if(!v || depth>10) return;
+        if(Array.isArray(v)){ for(var i=0;i<v.length;i++) walk(v[i], depth+1); return; }
+        if(typeof v==="object"){
+          var hasName = NAME_KEYS.some(function(k){ return v[k]!=null && String(v[k]).trim()!==""; });
+          if(hasName){
+            var name=normName(pick(v,NAME_KEYS));
+            var addrParts=[pick(v,ADDR_KEYS)];
+            var address=addrParts.filter(Boolean).join(" ");
+            var main=pick(v,["mainProduct","mainCategory","categoryName","mainBusiness","description"]);
+            var level=pick(v,["level","strengthTag","creditLevel","years","companyLevel","medalLevel","creditYears"]);
+            var url=pick(v,URL_KEYS);
+            if(name || address){ pushItem(name,"",address,main,level,url); }
+            // 供应商对象内部不再深入（避免误吞子对象）
+            return;
+          }
+          for(var k in v) if(v.hasOwnProperty(k)) walk(v[k], depth+1);
+        }
+      };
+      walk(dataObj, 0);
+    }
+    // 兜底：DOM 层（1688 结果页 css-modules 哈希类）
+    if(out.length===0){
+      var nameSel='[class^="shopRow--"] a[href*=".1688.com"][title], a[href*=".1688.com"][title]';
+      var cards=document.querySelectorAll('[class^="offerList--"], [class^="gridCell--"], [class*="offerCard--"]');
+      cards.forEach(function(card){
+        var nameEl=card.querySelector('[class^="shopRow--"] a[title], a[title]');
+        var name = nameEl ? (nameEl.getAttribute("title")||nameEl.textContent||"").trim() : "";
+        name=normName(name);
+        var addr="";
+        var addrEl=card.querySelector('[class*="location"],[class*="addr"],[class*="town"],[class*="province"]');
+        if(addrEl){ addr=(addrEl.textContent||"").replace(/\\s+/g,' ').trim(); }
+        var urlEl=card.querySelector('a[href*=".1688.com"]');
+        var url = urlEl ? (urlEl.href||urlEl.getAttribute("href")||"") : "";
+        var mainEl=card.querySelector('[class*="title"],[class*="product"],[class*="main"]');
+        var main = mainEl ? (mainEl.textContent||"").trim().slice(0,60) : "";
+        if(name || addr || url){ pushItem(name,"",addr,main,"",url); }
+      });
+    }
+    return out;
+  }
+
   function collect(){
     var list=[];
-    try{ list=fromData(window); }catch(e){}
+    // 优先 1688 结果页专用结构（window.data / 哈希类），命中即用
+    try{ list=from1688Result(); }catch(e){}
+    if(list.length===0){ try{ list=fromData(window); }catch(e){} }
     if(list.length===0){ try{ list=fromDOM(); }catch(e){} }
     window.__ltoolsSuppliers = JSON.stringify(list||[]);
     window.__ltoolsSuppliersCount = (list||[]).length;
@@ -817,26 +902,66 @@ const scrollLoadMoreJS = `
 const clickNextPageJS = `
 (function(){
   function txt(el){ return (el.textContent||"").replace(/\\s+/g,'').trim(); }
-  function isDisabled(a){ return a.hasAttribute('disabled')||/(disabled|disabled_)/.test(a.className||''); }
+  function isDisabled(a){ return a.hasAttribute('disabled')||/(arrowDisabled|disabled_)/.test(a.className||''); }
   function clickAnchor(a){
     if(!a) return false;
     if(isDisabled(a)) return false;
     try{ if(a.click) { a.click(); } else { a.dispatchEvent(new MouseEvent('click',{bubbles:true})); } }catch(e){ try{ location.href=a.href; }catch(e2){} }
     return true;
   }
-  // 策略 1：文本 = 下一页 / » / 下页
+  // 策略 1（1688 结果页）：[class^="pagination--"] 内的 nextArrow（禁用时含 arrowDisabled 类 → 到底了）
+  try{
+    var pg=document.querySelector('[class^="pagination--"]');
+    if(pg){
+      var next=pg.querySelector('[class*="nextArrow"]:not([class*="arrowDisabled"])');
+      if(next){
+        if(isDisabled(next)){ return 0; } // 到底了 / 禁用
+        if(clickAnchor(next)) return 1;
+      }
+      // nextArrow 不存在或 disabled：退化为"比当前页码大的 pageItem--* 数字项里最小的那个"
+      var items=pg.querySelectorAll('[class^="pageItem--"], [class*="pageItem--"]');
+      var cur=0;
+      items.forEach(function(it){
+        if(/active|selected|current/i.test(it.className||'')){
+          var m=(it.textContent||'').match(/(\\d+)/);
+          if(m) cur=parseInt(m[1],10);
+        }
+      });
+      var candidates=[];
+      items.forEach(function(it){
+        var m=(it.textContent||'').match(/(\\d+)/);
+        if(m){
+          var n=parseInt(m[1],10);
+          if(n>cur && !isDisabled(it)) candidates.push(n);
+        }
+      });
+      if(candidates.length>0){
+        candidates.sort(function(a,b){return a-b;});
+        var target=candidates[0];
+        var tEl=null;
+        items.forEach(function(it){
+          var m=(it.textContent||'').match(/(\\d+)/);
+          if(m && parseInt(m[1],10)===target) tEl=it;
+        });
+        if(tEl && clickAnchor(tEl)){ return 1; }
+      }
+      // 找到 pagination 但无法翻页（全 disabled / 无候选）→ 已到底
+      return 0;
+    }
+  }catch(e){}
+  // 策略 2：文本 = 下一页 / » / 下页
   var anchors=document.querySelectorAll('a');
   for(var i=0;i<anchors.length;i++){
     var t=txt(anchors[i]);
     if(t==='下一页'||t==='下页'||t==='»'||t==='›'||t==='>') { if(clickAnchor(anchors[i])) return 1; }
   }
-  // 策略 2：pagination 容器里文本=下一页
-  var pg=document.querySelectorAll('[class*="pagination"] a,[class*="pager"] a,[class*="page"] a');
-  for(var j=0;j<pg.length;j++){
-    var tt=txt(pg[j]);
-    if(tt==='下一页'||tt==='»'){ if(clickAnchor(pg[j])) return 1; }
+  // 策略 3：pagination 容器里文本=下一页
+  var pg2=document.querySelectorAll('[class*="pagination"] a,[class*="pager"] a');
+  for(var j=0;j<pg2.length;j++){
+    var tt=txt(pg2[j]);
+    if(tt==='下一页'||tt==='»'){ if(clickAnchor(pg2[j])) return 1; }
   }
-  // 策略 3：URL 翻页参数（pageNum / page）+1
+  // 策略 4：URL 翻页参数（pageNum / page）+1
   try{
     var u=new URL(location.href);
     var changed=false;
@@ -1057,6 +1182,25 @@ func (e *windowEngine) ClickNextPage() bool {
 	// 这里执行后等导航稳定（readyState + 固定 2s），由调用方判断"是否真的翻页成功"
 	// （用 URL/首卡片指纹变化）。返回 true 仅表示"点了 / 尝试了"。
 	w.ExecJS(clickNextPageJS)
+	return true
+}
+
+// SetURL 把子窗口导航到指定 URL（用于双窗编排：detail 窗逐个访问 item.Url）。
+// 返回 false 表示窗口未开。导航后由 installBridge 循环（80ms）重注 bridge，
+// 等待"详情页加载完"由调用方 time.Sleep 完成。
+func (e *windowEngine) SetURL(ctx context.Context, url string) bool {
+	w, ok := e.currentWindow()
+	if !ok {
+		return false
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	default:
+	}
+	if url != "" {
+		w.SetURL(url)
+	}
 	return true
 }
 
