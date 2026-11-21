@@ -735,13 +735,12 @@ func (w *WebviewWindow) ExecJSResult(js string, timeout time.Duration) (string, 
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	w.pendingJSMutex.Lock()
-	if !w.runtimeLoaded {
-		w.pendingJSMutex.Unlock()
-		// Runtime not loaded yet — cannot read a result synchronously.
-		return "", fmt.Errorf("webview runtime not loaded")
-	}
-	w.pendingJSMutex.Unlock()
+	// 注意：ExecJSResult **不**检查 runtimeLoaded。COM ExecuteScriptWithResult 是
+	// WebView2 原生能力，直接在 webview 里执行任意 JS 表达式并读回结果，**不依赖**
+	// Wails runtime JS（window.ltools）是否加载。子窗口导航到外部 URL（如 1688）后，
+	// Wails runtime 不注入外部页 → runtimeLoaded 恒 false → 若在此检查则子窗口永远
+	// 读不回结果。故此处放行；impl 未就绪（chromium==nil）由 execJSResultSubmit 兜底
+	// 返回 "webview not initialized"。
 
 	// 两段式（根治死锁）：
 	//  1) 主线程内提交 COM 调用（dispatchOnMainThread 非阻塞拿到结果 channel）。
