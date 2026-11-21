@@ -252,7 +252,7 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 	if url == "" {
 		url = "https://www.1688.com/"
 	}
-	w := e.app.Window.NewWithOptions(application.WebviewWindowOptions{
+	win := e.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:          e.name,
 		Title:         "1688 搜索",
 		Width:         1280,
@@ -263,11 +263,26 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 		AlwaysOnTop:   false,
 		Frameless:     false,
 		DisableResize: false,
+		// 治本：WebView2 COM 层 NewWindowRequested（target=_blank / window.open / <a target>）
+		// 在此拦截——不冒第二个窗，而是把目标 URL 导回当前子窗口内跳转（w.SetURL）。
+		// 主窗口不传此选项，故主窗口不受影响。详见 Wails patch（third_party/wails）。
+		// 导回当前子窗口：闭包捕获 e，回调触发时读 e.win（在 NewWithOptions 返回后已赋值）。
+		// 因 win（LHS 局部）在 RHS 字面量里尚未入作用域，故用 e.win 而非 win。
+		OnNewWindowRequest: func(uri string) {
+			if uri == "" {
+				return
+			}
+			// 拦截到一次"开新窗"请求 → 导回当前子窗口，不冒第二个窗。
+			e.logf(fmt.Sprintf("拦截新窗口请求 → 导回当前子窗口: %s", uri))
+			if e.win != nil {
+				e.win.SetURL(uri)
+			}
+		},
 	})
-	if w == nil {
+	if win == nil {
 		return fmt.Errorf("创建 1688 子窗口失败")
 	}
-	e.win = w
+	e.win = win
 
 	// 子窗口加载后，启动持久 bridge 注入循环（注入 ltoolsBridge + 导航拦截 hook）。
 	// 用 bridgeMu 保证同一时刻只有一个 installBridge goroutine（连点 OpenWindow 时幂等）。
@@ -318,6 +333,28 @@ func (e *windowEngine) startBridgeLoop() {
 // OpenLogin 打开子窗口到 1688 首页（供用户登录）。
 func (e *windowEngine) OpenLogin() error {
 	return e.OpenWindow(context.Background(), "https://www.1688.com/")
+}
+
+// TestNewWindowIntercept 诊断：开子窗口到 data: URL，触发一次 window.open('_blank')，
+// 等 COM 层 NewWindowRequested 回调，再报告子窗口数量（应恒为 1，无第二窗）。
+// 仅用于验证 patch 生效，正式构建可删除。
+func (e *windowEngine) TestNewWindowIntercept(ctx context.Context) string {
+	if err := e.OpenWindow(ctx, "data:text/html;charset=utf-8,<html><body onload='window.open(%22https://www.1688.com%22%2C%20%22_blank%22)'><script>setTimeout(function(){window.open(%22https://detail.1688.com%2Foffer%2F1.html%22,%20%22_blank%22)},500)</script></body></html>"); err != nil {
+		return "open failed: " + err.Error()
+	}
+	time.Sleep(4 * time.Second)
+	// 统计当前所有窗口（主窗 + 子窗 + 任何 COM 冒出的窗）。
+	all := e.app.Window.GetAll()
+	subCount, total := 0, len(all)
+	for _, ww := range all {
+		if ww != nil && ww.Name() == e.name {
+			subCount++
+		}
+	}
+	if e.logf != nil {
+		e.logf(fmt.Sprintf("[诊断] 触发 2 次 window.open('_blank')；总窗口数=%d，同名子窗(c1688-window)数=%d（应=1）。若日志还出现\"拦截新窗口请求\"即 patch 生效，无第二窗", total, subCount))
+	}
+	return fmt.Sprintf("totalWindows=%d, subWindowCount=%d", total, subCount)
 }
 
 // CloseLogin 关闭子窗口。

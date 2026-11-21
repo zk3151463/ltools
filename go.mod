@@ -10,6 +10,11 @@ require (
 	howett.net/plist v1.0.2-0.20250314012144-ee69052608d9
 )
 
+// Local vendored copy of Wails v3 with a minimal NewWindowRequested patch
+// (edge.Chromium wiring + per-window OnNewWindowRequest option). Remove this
+// once upstream ships OnNewWindowRequest / OnBeforeNavigate (PR #6300).
+replace github.com/wailsapp/wails/v3 => ./third_party/wails
+
 require (
 	al.essio.dev/pkg/shellescape v1.6.0 // indirect
 	github.com/coder/websocket v1.8.14 // indirect
