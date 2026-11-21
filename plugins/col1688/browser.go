@@ -182,6 +182,7 @@ func (e *windowEngine) startHTMLReturn() {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/c1688/html", e.htmlReturnHandler)
+	mux.HandleFunc("/c1688/diag", e.htmlDiagHandler)
 	srv := &http.Server{Handler: mux}
 	e.htmlServer = srv
 	go func() {
@@ -189,6 +190,56 @@ func (e *windowEngine) startHTMLReturn() {
 	}()
 	if e.logf != nil {
 		e.logf(fmt.Sprintf("HTML 回传服务已启动（127.0.0.1:%d）", htmlReturnPort))
+	}
+}
+
+// htmlDiagHandler 接收 /c1688/diag（diagnoseJS 探针 + __ltoolsCollect 状态）。
+// 仅记日志，不影响回传流程。诊断信息：bridge 是否装好 / __ltoolsCollect 是否存在 /
+// 当前 URL / readyState / 上次取到的 itemsCount。
+func (e *windowEngine) htmlDiagHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	b, err := readBody(r, 100_000) // 诊断 body 很小（~1KB），100KB 足够
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("read body failed"))
+		return
+	}
+	var d map[string]any
+	if err := json.Unmarshal(b, &d); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("bad json"))
+		return
+	}
+	if e.logf != nil {
+		bridgeInstalled, _ := d["bridgeInstalled"].(bool)
+		collectFn, _ := d["collectFn"].(string)
+		collectSuppliersFn, _ := d["collectSuppliersFn"].(string)
+		pageURL, _ := d["url"].(string)
+		readyState, _ := d["readyState"].(string)
+		statusRaw, _ := d["status"].(map[string]any)
+		var statusDesc string
+		if statusRaw != nil {
+			hasFn, _ := statusRaw["hasFn"].(bool)
+			itemsCount, _ := statusRaw["itemsCount"].(float64)
+			statusURL, _ := statusRaw["url"].(string)
+			statusReady, _ := statusRaw["readyState"].(string)
+			statusTarget, _ := statusRaw["target"].(string)
+			statusDesc = fmt.Sprintf("status{hasFn=%v,itemsCount=%.0f,url=%s,readyState=%s,target=%s}",
+				hasFn, itemsCount, statusURL, statusReady, statusTarget)
+		} else {
+			statusDesc = "status{null}"
+		}
+		e.logf(fmt.Sprintf("[diag] bridgeInstalled=%v collectFn=%s collectSuppliersFn=%s url=%s readyState=%s | %s",
+			bridgeInstalled, collectFn, collectSuppliersFn, pageURL, readyState, statusDesc))
+	}
+	if _, werr := w.Write([]byte("ok")); werr != nil {
+		return
 	}
 }
 
@@ -200,6 +251,25 @@ func (e *windowEngine) htmlReturnHandler(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	// Image 兜底：fetch 被 CSP 拦时，__ltoolsCollect 会把 items 编码进 ?b= query，
+	// 服务端读 query 重建 payload（没有 html，仅 items）。
+	if r.Method == http.MethodGet {
+		bParam := r.URL.Query().Get("b")
+		if bParam == "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var p pageHTMLPayload
+		if err := json.Unmarshal([]byte(bParam), &p); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		e.dispatchPayload(p, "image-fallback")
+		w.WriteHeader(http.StatusNoContent)
+		// Image 请求不读响应；写一个 1x1 透明 GIF 防浏览器控制台红叉。
+		_, _ = w.Write([]byte{0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x21, 0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x02, 0x4C, 0x01, 0x00, 0x3B})
 		return
 	}
 	b, err := readBody(r, 5_000_000) // 上限 5MB，防超大页
@@ -214,7 +284,18 @@ func (e *windowEngine) htmlReturnHandler(w http.ResponseWriter, r *http.Request)
 		_, _ = w.Write([]byte("bad json"))
 		return
 	}
-	// 推给正在等待的 CollectCurrentPage；若无人在等则丢弃（channel 有缓冲兜底）。
+	e.dispatchPayload(p, "fetch")
+	if _, werr := w.Write([]byte("ok")); werr != nil {
+		return
+	}
+}
+
+// dispatchPayload 把收到的 payload 推给正在等待的 collectReq（或 pageHTMLCh 兜底），
+// 并按 source（"fetch" / "image-fallback"）记一行简短日志。
+func (e *windowEngine) dispatchPayload(p pageHTMLPayload, source string) {
+	if e.logf != nil && len(p.Items) > 0 {
+		e.logf(fmt.Sprintf("[回传-%s] 收到 %d 条 items（url=%s）", source, len(p.Items), p.URL))
+	}
 	select {
 	case e.collectReq <- p:
 	default:
@@ -222,9 +303,6 @@ func (e *windowEngine) htmlReturnHandler(w http.ResponseWriter, r *http.Request)
 		case e.pageHTMLCh <- p:
 		default:
 		}
-	}
-	if _, werr := w.Write([]byte("ok")); werr != nil {
-		return
 	}
 }
 
@@ -501,6 +579,34 @@ func (e *windowEngine) CloseLogin() {
 	e.CloseWindow()
 }
 
+// diagnoseJS 读 window.__ltoolsCollectStatus（诊断探针），fetch POST 到 /c1688/diag。
+// Go 端 CollectCurrentPage 第一次超时后注入它，把"为什么超时"变成日志可查（root cause 定位）。
+// 不受 CSP connect-src 限制（127.0.0.1 兜底走 sendBeacon / Image）。
+const diagnoseJS = `
+(function(){
+  try {
+    var status = window.__ltoolsCollectStatus || null;
+    var target = (window.__ltoolsCollectURL || '').replace(/\/c1688\/html$/, '/c1688/diag');
+    var body = JSON.stringify({
+      status: status,
+      bridgeInstalled: !!window.__ltoolsBridgeInstalled,
+      collectFn: typeof window.__ltoolsCollect,
+      collectSuppliersFn: typeof window.__ltoolsCollectSuppliers,
+      url: location.href,
+      readyState: document.readyState,
+      ts: Date.now(),
+    });
+    if (navigator.sendBeacon) {
+      var blob = new Blob([body], { type: 'application/json' });
+      if (navigator.sendBeacon(target, blob)) return;
+    }
+    if (window.fetch) {
+      fetch(target, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: body, keepalive: true }).catch(function(){});
+    }
+  } catch (e) {}
+})();
+`
+
 // bridgeJS 注入到子窗口的脚本。做两件事（均按文档幂等）：
 //
 //  1. 数据回传：挂 window.__ltoolsCollect()，Go 端 CollectCurrentPage 调它把当前页
@@ -529,7 +635,21 @@ const bridgeJS = `
   // 主通道：fetch POST 到 Go 端本地回环（window.__ltoolsCollectURL，由 install 循环注入），
   // https 页向 http 127.0.0.1 发 body-only fetch 允许；响应不读（规避 CORS 读响应限制）。
   // 兜底通道：若有 window.ltools（内部页 / dev），走 Wails 事件；再退 parent.postMessage。
+  // CSP 兜底：sendBeacon（items 64KB 内）/ Image src（不受 connect-src 限制）。
   window.__ltoolsCollect = function() {
+    // 诊断信息挂到 window，Go 端超时后 ExecJS 探针读它（diagnoseJS）
+    try {
+      var itemsForStatus = [];
+      try { if (window.__ltoolsSuppliers) { itemsForStatus = JSON.parse(window.__ltoolsSuppliers) || []; } } catch (e) {}
+      window.__ltoolsCollectStatus = {
+        ts: Date.now(),
+        hasFn: typeof window.__ltoolsCollectSuppliers === 'function',
+        itemsCount: (itemsForStatus || []).length,
+        url: location.href,
+        readyState: document.readyState,
+        target: window.__ltoolsCollectURL || '',
+      };
+    } catch (e) {}
     try {
       // 取数：优先用 suppliersJS 已算好的 window.__ltoolsSuppliers（结构化 JSON），
       // 没有则回退整页 HTML（Go 端 parseHTML 兜底）。
@@ -548,14 +668,31 @@ const bridgeJS = `
       if (target && window.fetch) {
         // body-only：不读 response（避免 CORS 读响应报错），送达即成功。
         // Content-Type: text/plain → 简单请求，不触发 preflight。
+        // CSP 兜底：fetch 被 CSP connect-src 拦截（127.0.0.1 不在白名单）时走 sendBeacon（items）/
+        // Image（items 序列化为 query），两者都不受 connect-src 限制。
+        const doFallback = function() {
+          try {
+            // sendBeacon：items JSON 通常 < 64KB，够用；html 太大放不进，仅回传 items。
+            if (navigator.sendBeacon) {
+              const blob = new Blob([JSON.stringify({ url: location.href, items: items })], { type: 'application/json' });
+              navigator.sendBeacon(target.replace(/\/c1688\/html$/, '/c1688/html') , blob);
+            }
+          } catch (e) {}
+          try {
+            // Image 兜底：把 items 塞进 query（64KB 内，超长会被截断），服务端读 query 也能用。
+            const img = new Image();
+            const qs = encodeURIComponent(JSON.stringify({ url: location.href, items: items })).slice(0, 60000);
+            img.src = target + '?b=' + qs;
+          } catch (e) {}
+        };
         try {
           fetch(target, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain' },
             body: JSON.stringify(payload),
             keepalive: true,
-          }).catch(function(){});
-        } catch (e) {}
+          }).catch(doFallback);
+        } catch (e) { doFallback(); }
         return 'fetch';
       }
       if (window.ltools && window.ltools.Events && window.ltools.Events.Emit) {
@@ -1036,7 +1173,12 @@ func (e *windowEngine) closeBridgeLoop() {
 // **本地回环 HTTP**（127.0.0.1:48217/c1688/html，见 startHTMLReturn）POST 回 Go →
 // 本方法阻塞等待 collectReq → parseHTML 解析 → 返回 []Supplier。
 // 兜底：Wails 事件 c1688:page-html（pageHTMLCh）仍保留，若子窗口是内部页（有 window.ltools）
-// 也能走事件回传。外部页主要走 HTTP 回传。超时（8s）返回 nil。
+// 也能走事件回传。外部页主要走 HTTP 回传。
+//
+// 超时策略（3 次重试）：8s + 3s + 3s，覆盖"刚跳页 JS 上下文还没就绪"场景
+// （80ms 循环重注 bridge + suppliersJS 需要 ~1-2s 落到新文档）。
+// 第一次超时时注入 diagnoseJS 探针（读 window.__ltoolsCollectStatus POST /c1688/diag），
+// Go 端记 [diag] 日志定位 root cause（bridge 未装 / CSP 拦 fetch / 当前在风控验证页等）。
 func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, logf func(string)) []Supplier {
 	w, ok := e.currentWindow()
 	if !ok {
@@ -1050,34 +1192,39 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 	e.drainChannel()
 	e.drainCollectReq()
 
-	// 触发子窗口执行 __ltoolsCollect（它会 fetch POST 到本地回环）
-	w.ExecJS(`if (window.__ltoolsCollect) window.__ltoolsCollect();`)
+	// 3 次重试：8s + 3s + 3s。第二次超时后注入 diagnoseJS 探针。
+	for attempt := 0; attempt < 3; attempt++ {
+		w.ExecJS(`if (window.__ltoolsCollect) window.__ltoolsCollect();`)
+		if attempt == 1 {
+			// 第二次超时后注入诊断探针（把 window.__ltoolsCollectStatus POST 到 /c1688/diag）
+			w.ExecJS(diagnoseJS)
+		}
+		wait := 8 * time.Second
+		if attempt != 0 {
+			wait = 3 * time.Second
+		}
+		if p, done := e.collectReqWait(ctx, wait); done {
+			return e.finishCollect(p, source, logf)
+		}
+	}
+	if logf != nil {
+		logf("子窗口回传 HTML 超时（3 次重试均失败）；请确认子窗口已加载 1688 页面且未被拦截（回传走 127.0.0.1:48217）。[diag] 日志见上。")
+	}
+	return nil
+}
 
-	// 等待回传（HTTP 通道优先，事件通道兜底）
+// collectReqWait 阻塞等待 collectReq 或 pageHTMLCh（任一有值即返回），或超时 / ctx 取消。
+// 返回 (payload, true) 表示拿到数据；(zero, false) 表示没拿到。
+func (e *windowEngine) collectReqWait(ctx context.Context, d time.Duration) (pageHTMLPayload, bool) {
 	select {
 	case p := <-e.collectReq:
-		return e.finishCollect(p, source, logf)
+		return p, true
 	case p := <-e.pageHTMLCh:
-		return e.finishCollect(p, source, logf)
-	case <-time.After(8 * time.Second):
-		// 超时：再试一次（fetch 可能慢 / 事件在 ExecJS 前发出被错过）
-		w.ExecJS(`if (window.__ltoolsCollect) window.__ltoolsCollect();`)
-		select {
-		case p := <-e.collectReq:
-			return e.finishCollect(p, source, logf)
-		case p := <-e.pageHTMLCh:
-			return e.finishCollect(p, source, logf)
-		case <-time.After(3 * time.Second):
-			if logf != nil {
-				logf("子窗口回传 HTML 超时；请确认子窗口已加载 1688 页面且未被拦截（回传走 127.0.0.1:48217）")
-			}
-			return nil
-		}
+		return p, true
+	case <-time.After(d):
+		return pageHTMLPayload{}, false
 	case <-ctx.Done():
-		if logf != nil {
-			logf("已取消")
-		}
-		return nil
+		return pageHTMLPayload{}, false
 	}
 }
 
