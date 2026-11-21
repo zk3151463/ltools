@@ -581,12 +581,45 @@ func (e *Chromium) EvalWithResult(script string, timeout time.Duration) chan Eva
 	handler := newICoreWebView2ExecuteScriptWithResultCompletedHandler(impl)
 	handlerAddRef(unsafe.Pointer(handler))
 
-	err := wv21.ExecuteScriptWithResult(script, handler)
-	if err != nil {
-		// 提交失败：回调不会来了，立刻释放 handler 并返回错误。
+	// Transient COM errors (e.g. RESOURCE_NOT_IN_CORRECT_STATE during
+	// dual-window concurrent activity, DPI transition, or page navigation)
+	// are retried. Wails' own transient-error philosophy (see Eval / SetSize /
+	// PutBounds): "dropped/failed call during reconfiguration is recoverable".
+	// For synchronous read-back we retry up to 2 times (3 total attempts).
+	//
+	// Retry is safe: if the error is persistent (UTF16 encode failure, etc.),
+	// the retry will fail immediately on the same condition and we exit after
+	// 3 total attempts. If transient, the backoff lets WebView2 settle.
+	const maxAttempts = 3
+	var submitErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			// Brief backoff + re-query the interface (previous ref may be stale).
+			time.Sleep(200 * time.Millisecond)
+			wv21.Release()
+			wv21 = e.webview.GetICoreWebView2_21()
+			if wv21 == nil {
+				// Old runtime: fall back to Eval (fire-and-forget, no result).
+				e.Eval(script)
+				handlerRelease(unsafe.Pointer(handler))
+				result <- EvalResult{Err: errors.New("WebView2 ICoreWebView2_21 not supported (old runtime); fell back to Eval")}
+				close(result)
+				return result
+			}
+		}
+		submitErr = wv21.ExecuteScriptWithResult(script, handler)
+		if submitErr == nil {
+			break
+		}
+		// Non-Win32 error (Go-level, e.g. UTF16PtrFromString) → no point retrying.
+		if _, isWinErrno := submitErr.(windows.Errno); !isWinErrno {
+			break
+		}
+	}
+	if submitErr != nil {
 		handlerRelease(unsafe.Pointer(handler))
 		wv21.Release()
-		result <- EvalResult{Err: fmt.Errorf("ExecuteScriptWithResult: %w", err)}
+		result <- EvalResult{Err: fmt.Errorf("ExecuteScriptWithResult: %w (retried %d times)", submitErr, maxAttempts-1)}
 		close(result)
 		return result
 	}
