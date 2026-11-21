@@ -118,6 +118,13 @@ func main() {
 				"--disable-web-security", // 禁用同源策略
 			}, // webview2 启动参数
 		},
+		// 子窗口（外部 1688 页）用 window.external.invoke 回传 c1688:page-html payload。
+		// Wails 框架层 handleWindowMessage 对非 "wails:" 开头消息调此回调 →
+		// col1688.DispatchRawMessage → 各 engine 的 handleRawMessage → pageHTMLCh。
+		// WebView2 原生通信，不被 CSP 拦，不走 127.0.0.1。
+		RawMessageHandler: func(window application.Window, message string, originInfo *application.OriginInfo) {
+			col1688.DispatchRawMessage(message)
+		},
 	})
 
 	// 设置 proxyHandler 的 app 引用，用于访问环境信息

@@ -103,6 +103,33 @@ func newDetailWindowEngine(app *application.App, diagDir string) *windowEngine {
 	return e
 }
 
+// rawMessageListeners 包级 channel：main.go 的 application.Options.RawMessageHandler
+// 把子窗口 window.external.invoke 的原始 JSON 消息写进来，各 engine 的 handleRawMessage
+// 监听消费。用 slice + mutex 支持多个 engine（列表 + 详情）。
+var (
+	rawMsgMu       sync.Mutex
+	rawMsgHandlers []func(message string)
+)
+
+// SetRawMessageHandler 由 main.go 在创建 app 时调用（RawMessageHandler 闭包内）。
+// 注册一个接收 window.external.invoke 原始消息的回调。
+func SetRawMessageHandler(fn func(message string)) {
+	rawMsgMu.Lock()
+	rawMsgHandlers = append(rawMsgHandlers, fn)
+	rawMsgMu.Unlock()
+}
+
+// dispatchRawMessage 由 main.go 的 RawMessageHandler 调用，把 message 分发给所有已注册的 handler。
+func DispatchRawMessage(message string) {
+	rawMsgMu.Lock()
+	handlers := make([]func(string), len(rawMsgHandlers))
+	copy(handlers, rawMsgHandlers)
+	rawMsgMu.Unlock()
+	for _, h := range handlers {
+		h(message)
+	}
+}
+
 // registerEvents 在 app 启动后调用，注册 c1688:page-html 事件监听。
 // 必须在 CreateWindow 之前调用，否则子窗口回传的事件会丢失。
 func (e *windowEngine) registerEvents() {
@@ -111,6 +138,11 @@ func (e *windowEngine) registerEvents() {
 	}
 	// 注册"窗口创建"兜底钩子（路线 C）：任何 WebView2 冒出的新窗口被即时关闭。
 	e.registerWindowGuard()
+	// 注册 window.external.invoke 消息处理器（子窗口 __ltoolsCollect 发 c1688:page-html
+	// JSON payload，Wails 框架层 RawMessageHandler → DispatchRawMessage → 这里）。
+	SetRawMessageHandler(func(message string) {
+		e.handleRawMessage(message)
+	})
 	_ = e.app.Event.On("c1688:page-html", func(ev *application.CustomEvent) {
 		if ev == nil || ev.Data == nil {
 			return
@@ -147,6 +179,33 @@ func (e *windowEngine) registerEvents() {
 		default:
 		}
 	})
+}
+
+// handleRawMessage 处理子窗口 window.external.invoke 发来的原始 JSON 消息。
+// 消息格式：JSON.stringify({ url, title, html, items })——与 pageHTMLPayload 一致。
+// 用 "c1688" 或 JSON 对象特征过滤，非本插件的消息直接丢弃。
+func (e *windowEngine) handleRawMessage(message string) {
+	// 快速过滤：消息必须是 JSON 对象且含 "url" 或 "items" 或 "html" 字段
+	// （window.external.invoke 发的 c1688:page-html payload）
+	if !strings.HasPrefix(message, "{") {
+		return
+	}
+	var p pageHTMLPayload
+	if err := json.Unmarshal([]byte(message), &p); err != nil {
+		// 不是本插件的消息（可能是其他窗口的 raw message），忽略
+		return
+	}
+	// 至少有一个字段非零才处理（避免空对象误触发）
+	if p.URL == "" && p.HTML == "" && len(p.Items) == 0 {
+		return
+	}
+	if e.logf != nil {
+		e.logf(fmt.Sprintf("[回传] 收到 %d 条供应商（url=%s）via window.external.invoke", len(p.Items), p.URL))
+	}
+	select {
+	case e.pageHTMLCh <- p:
+	default:
+	}
 }
 
 // htmlReturnPort 子窗口回传 HTML 的固定本地回环端口。
@@ -666,6 +725,15 @@ const bridgeJS = `
       const html = document.documentElement.outerHTML || "";
       const payload = { url: location.href, title: document.title, items: items, html: html };
       const target = window.__ltoolsCollectURL;
+      // 首选：window.external.invoke（Wails 框架层 RawMessageHandler 接收，
+      // WebView2 原生 chrome.webview.postMessage，不被 CSP 拦，不走 127.0.0.1）。
+      if (window.external && window.external.invoke) {
+        try {
+          window.external.invoke(JSON.stringify(payload));
+          window.__ltoolsCollectResult = 'external-invoke';
+          return 'external-invoke';
+        } catch (e) {}
+      }
       if (target && window.fetch) {
         // body-only：不读 response（避免 CORS 读响应报错），送达即成功。
         // Content-Type: text/plain → 简单请求，不触发 preflight。
