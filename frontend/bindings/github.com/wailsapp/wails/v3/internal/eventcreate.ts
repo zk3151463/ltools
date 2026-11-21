@@ -18,22 +18,23 @@ import * as col1688$0 from "../../../../../ltools/plugins/col1688/models.js";
 
 function configure() {
     Object.freeze(Object.assign($Create.Events, {
-        "c1688:log": $$createType0,
-        "c1688:page-html": $$createType1,
-        "c1688:progress": $$createType2,
+        "c1688:item": $$createType0,
+        "c1688:log": $$createType1,
+        "c1688:page-html": $$createType2,
+        "c1688:progress": $$createType3,
         "c1688:result": $$createType4,
         "search:results": $$createType7,
         "update:available": $$createType9,
-        "url:open": $$createType1,
+        "url:open": $$createType2,
     }));
 }
 
 // Private type creation functions
-const $$createType0 = col1688$0.LogEntry.createFrom;
-const $$createType1 = $Create.Map($Create.Any, $Create.Any);
+const $$createType0 = col1688$0.Supplier.createFrom;
+const $$createType1 = col1688$0.LogEntry.createFrom;
 const $$createType2 = $Create.Map($Create.Any, $Create.Any);
-const $$createType3 = col1688$0.Supplier.createFrom;
-const $$createType4 = $Create.Array($$createType3);
+const $$createType3 = $Create.Map($Create.Any, $Create.Any);
+const $$createType4 = $Create.Array($$createType0);
 const $$createType5 = plugins$0.SearchResult.createFrom;
 const $$createType6 = $Create.Nullable($$createType5);
 const $$createType7 = $Create.Array($$createType6);

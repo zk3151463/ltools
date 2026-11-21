@@ -67,6 +67,8 @@ func init() {
 	application.RegisterEvent[col1688.LogEntry]("c1688:log")
 	application.RegisterEvent[[]col1688.Supplier]("c1688:result")
 	application.RegisterEvent[map[string]int]("c1688:progress")
+	// 单条供应商（逐条累积，前端结果表实时加行）
+	application.RegisterEvent[col1688.Supplier]("c1688:item")
 	application.RegisterEvent[string]("c1688:state")
 	// 1688 子窗口回传当前页 HTML（Wails 事件总线，Go 端监听后 parseHTML）
 	application.RegisterEvent[map[string]string]("c1688:page-html")

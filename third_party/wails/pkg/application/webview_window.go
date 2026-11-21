@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/wailsapp/wails/v3/internal/assetserver"
@@ -116,6 +117,7 @@ type (
 		setContentProtection(enabled bool)
 		attachModal(modalWindow *WebviewWindow)
 		setNonClientHitTestRegions([]nonClientHitTestRegion)
+		execJSResult(js string, timeout time.Duration) (string, error)
 	}
 
 	nonClientHitTestKind string
@@ -712,6 +714,40 @@ func (w *WebviewWindow) ExecJS(js string) {
 		w.pendingJS = append(w.pendingJS, js)
 		w.pendingJSMutex.Unlock()
 	}
+}
+
+// ExecJSResult executes the given javascript in the context of the window and
+// returns its result (the JSON-serialised value of the expression), blocking
+// up to timeout. Unlike ExecJS (fire-and-forget), this reads the result back
+// via the WebView2 COM callback (ICoreWebView2_21.ExecuteScriptWithResult on
+// Windows).
+//
+// The javascript must be an expression that yields a JSON-serializable value
+// (e.g. JSON.stringify(...), 1, "ok"). The returned string is that value's
+// JSON form. JS errors / Succeeded=false / timeout / no-op on non-Windows
+// (or old WebView2 runtimes that fall back to fire-and-forget) all surface as
+// a non-nil error; callers treat a non-nil error as "no data".
+func (w *WebviewWindow) ExecJSResult(js string, timeout time.Duration) (string, error) {
+	if w.impl == nil || w.isDestroyed() {
+		return "", fmt.Errorf("window destroyed")
+	}
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	var out string
+	var outErr error
+	w.pendingJSMutex.Lock()
+	if w.runtimeLoaded {
+		w.pendingJSMutex.Unlock()
+		InvokeSync(func() {
+			out, outErr = w.impl.execJSResult(js, timeout)
+		})
+	} else {
+		w.pendingJSMutex.Unlock()
+		// Runtime not loaded yet — cannot read a result synchronously.
+		return "", fmt.Errorf("webview runtime not loaded")
+	}
+	return out, outErr
 }
 
 // Fullscreen sets the window to fullscreen mode. Min/Max size constraints are disabled.

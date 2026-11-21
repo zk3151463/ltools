@@ -1,6 +1,7 @@
 package application
 
 import (
+	"time"
 	"unsafe"
 
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -15,6 +16,12 @@ type Window interface {
 	EnableSizeConstraints()
 	Error(message string, args ...any)
 	ExecJS(js string)
+	// ExecJSResult executes js and synchronously returns its result (the
+	// JSON-serialised value of the expression), blocking up to timeout.
+	// On Windows this uses the WebView2 COM callback
+	// (ICoreWebView2_21.ExecuteScriptWithResult); a non-nil error means
+	// "no data" (JS error / timeout / unsupported runtime / no-op platform).
+	ExecJSResult(js string, timeout time.Duration) (string, error)
 	Focus()
 	ForceReload()
 	Fullscreen() Window

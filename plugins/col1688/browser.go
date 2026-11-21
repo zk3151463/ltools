@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -1169,16 +1170,81 @@ func (e *windowEngine) closeBridgeLoop() {
 	}
 }
 
-// CollectCurrentPage 对子窗口当前页执行提取：注入 __ltoolsCollect → 子窗口把 HTML 通过
-// **本地回环 HTTP**（127.0.0.1:48217/c1688/html，见 startHTMLReturn）POST 回 Go →
-// 本方法阻塞等待 collectReq → parseHTML 解析 → 返回 []Supplier。
-// 兜底：Wails 事件 c1688:page-html（pageHTMLCh）仍保留，若子窗口是内部页（有 window.ltools）
-// 也能走事件回传。外部页主要走 HTTP 回传。
+// collectItems 通过 WebView2 ExecuteScriptWithResult（chromium.EvalWithResult → ExecJSResult）
+// 同步读回当前页的结构化供应商数据（JSON 字符串），不再依赖 127.0.0.1 HTTP 回传。
+// 这是"回传 HTML 超时"问题的根治方案：JS 取数结果直接 COM 读回，不经过外部 fetch。
 //
-// 超时策略（3 次重试）：8s + 3s + 3s，覆盖"刚跳页 JS 上下文还没就绪"场景
-// （80ms 循环重注 bridge + suppliersJS 需要 ~1-2s 落到新文档）。
-// 第一次超时时注入 diagnoseJS 探针（读 window.__ltoolsCollectStatus POST /c1688/diag），
-// Go 端记 [diag] 日志定位 root cause（bridge 未装 / CSP 拦 fetch / 当前在风控验证页等）。
+// 流程：对子窗口 ExecJS(suppliersJS) 让它在当前文档里算好 window.__ltoolsSuppliers（JSON 串），
+// 再 ExecJSResult 读回该串 → Unmarshal 成 []Supplier。
+// 返回 nil 表示取不到（窗口未开 / ExecJSResult 超时 / 非结果页）。
+func (e *windowEngine) collectItems(ctx context.Context) []Supplier {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+	}
+	w, ok := e.currentWindow()
+	if !ok {
+		return nil
+	}
+	// 1) 先让取数脚本在当前文档跑一遍（幂等，整页导航后由 install 循环重注兜底）。
+	//    suppliersJS 末尾 collect() 会把结果写到 window.__ltoolsSuppliers。
+	w.ExecJS(suppliersJS)
+	// 2) 同步读回（COM 回调）。给足 5s：JS 提取 + COM 回调往返。
+	out, err := w.ExecJSResult(`window.__ltoolsSuppliers || "[]"`, 5*time.Second)
+	if err != nil {
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[ExecJSResult] 读回供应商数据失败：%v", err))
+		}
+		return nil
+	}
+	items, err := unmarshalSuppliers(out)
+	if err != nil {
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[ExecJSResult] 解析供应商 JSON 失败：%v（raw=%s）", err, truncateStr(out, 200)))
+		}
+		return nil
+	}
+	return items
+}
+
+// unmarshalSuppliers 把 JS 读回的 JSON 字符串解析成 []Supplier。
+// 兼容两种形态：直接是数组 '[{...}]'；或外层包了对象（容错）。空/非 JSON 返回 (nil, nil)。
+func unmarshalSuppliers(raw string) ([]Supplier, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" || raw == "[]" {
+		return nil, nil
+	}
+	var items []Supplier
+	if err := json.Unmarshal([]byte(raw), &items); err != nil {
+		// 可能 JS 返回的是带外层对象的字符串，再试包一层
+		var wrap struct {
+			Items []Supplier `json:"items"`
+		}
+		if werr := json.Unmarshal([]byte(raw), &wrap); werr == nil {
+			return wrap.Items, nil
+		}
+		return nil, err
+	}
+	return items, nil
+}
+
+// truncateStr 截断长字符串（日志用）。
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
+
+// CollectCurrentPage 对子窗口当前页执行提取，返回 []Supplier。
+//
+// 首选通道（同步读回，根治"回传 HTML 超时"）：collectItems() 走 WebView2
+// ExecuteScriptWithResult，把 JS 取到的 items JSON 直接 COM 读回，不经 127.0.0.1。
+// 兜底通道（HTTP 回传）：collectItems 拿不到时（旧 WebView2 运行时 / JS 上下文异常），
+// 退回到 __ltoolsCollect → fetch POST 127.0.0.1:48217 的传统路径。
 func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, logf func(string)) []Supplier {
 	w, ok := e.currentWindow()
 	if !ok {
@@ -1188,7 +1254,27 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 		return nil
 	}
 
-	// 清空两个回传通道里可能残留的旧 payload（防上一次的 HTML 串到本次）
+	// ---- 首选：同步读回（不依赖 HTTP 回传 / 不依赖外部 fetch）----
+	if items := e.collectItems(ctx); len(items) > 0 {
+		for i := range items {
+			if items[i].Source == "" {
+				items[i].Source = source
+			}
+			if items[i].Time == "" {
+				items[i].Time = nowLocal()
+			}
+		}
+		if logf != nil {
+			logf(fmt.Sprintf("[ExecJSResult] 同步读回 %d 条供应商（url=%s）", len(items), e.currentURLForLog()))
+		}
+		return items
+	}
+
+	// ---- 兜底：HTTP 回传（__ltoolsCollect → fetch 127.0.0.1:48217）----
+	if logf != nil {
+		logf("同步读回未取到数据，回退 HTTP 回传通道（__ltoolsCollect）")
+	}
+	_ = w
 	e.drainChannel()
 	e.drainCollectReq()
 
@@ -1211,6 +1297,21 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 		logf("子窗口回传 HTML 超时（3 次重试均失败）；请确认子窗口已加载 1688 页面且未被拦截（回传走 127.0.0.1:48217）。[diag] 日志见上。")
 	}
 	return nil
+}
+
+// currentURLForLog 取子窗口当前 URL（仅日志用，失败返回空）。
+func (e *windowEngine) currentURLForLog() string {
+	w, ok := e.currentWindow()
+	if !ok {
+		return ""
+	}
+	out, err := w.ExecJSResult(`location.href`, 2*time.Second)
+	if err != nil {
+		return ""
+	}
+	// location.href 读回是带引号的 JSON 字符串（如 "https://..."）
+	out = strings.Trim(out, `"`)
+	return out
 }
 
 // collectReqWait 阻塞等待 collectReq 或 pageHTMLCh（任一有值即返回），或超时 / ctx 取消。
@@ -1297,6 +1398,9 @@ func (e *windowEngine) IsWindowOpen() bool {
 
 // ScrollToBottom 在子窗口里滚动加载到底（触发懒加载），每 interval 滚一屏，
 // 直到"到底"（连续 2 次无新增 或 超过 6 屏）。用于采当前页前把懒加载内容抓全。
+//
+// 现走 ExecJSResult 同步读回：先 ExecJS(scrollLoadMoreJS) 滚一屏（写 window.__ltoolsScrollDone），
+// 再 ExecJSResult 读回该标记（"1"=到底 / "0"=还有）。读回失败退化为"固定滚 N 次"旧行为。
 func (e *windowEngine) ScrollToBottom(interval time.Duration) {
 	if interval <= 0 {
 		interval = 1200 * time.Millisecond
@@ -1306,30 +1410,51 @@ func (e *windowEngine) ScrollToBottom(interval time.Duration) {
 		if !ok {
 			return
 		}
+		// 滚一屏（scrollLoadMoreJS 末尾写 window.__ltoolsScrollDone = atBottom?1:0）。
 		w.ExecJS(scrollLoadMoreJS)
-		// 读"是否到底"：再 ExecJS 把结果存到 window，然后读（ExecJS 是 void，
-		// 用一个可被 JS 写、Go 用 ExecJS 触发的同步判定：再跑一次 scrollLoadMoreJS
-		// 并读 window.__ltoolsScrollDone 需要返回值；退化为"固定滚动 N 次"策略）。
-		// 这里简化：滚 6 次即视为到底（1688 一页内容有限），每次等 interval。
-		if i >= 5 {
+		// 同步读回"是否到底"，明确判定（替代旧"固定滚 6 次"猜测）。
+		done := false
+		if out, err := w.ExecJSResult(`window.__ltoolsScrollDone ? 1 : 0`, 2*time.Second); err == nil {
+			done = strings.TrimSpace(out) == "1"
+		}
+		if done {
+			return
+		}
+		if i >= 7 {
 			break
 		}
 		time.Sleep(interval)
 	}
 }
 
-// ClickNextPage 在子窗口里点「下一页」。返回 true 表示点了（页面将跳转）。
-// 定位策略见 clickNextPageJS（文本"下一页/»" → pagination 容器 → URL 参数 +1）。
+// ClickNextPage 在子窗口里点「下一页」。返回 true 表示点了（页面将跳转），
+// false 表示没找到下一页（已到底 / 风控拦截页）。
+// 定位策略见 clickNextPageJS（pagination nextArrow → 文本 → URL 参数 +1）。
+//
+// 现走 ExecJSResult 同步读回 clickNextPageJS 的返回值（"1"/"0"），不再"盲点 + 指纹猜测"：
+// 读到 "1" = 真点了；读到 "0" = 明确到底/没下一页，调用方据此停止翻页（替代指纹猜测）。
+// 读回失败（超时/旧运行时）时退化为"盲点"并返回 true（保持旧行为，让调用方靠指纹兜底）。
 func (e *windowEngine) ClickNextPage() bool {
 	w, ok := e.currentWindow()
 	if !ok {
 		return false
 	}
-	// clickNextPageJS 执行点击；由于 ExecJS 是 void 读不回返回值，
-	// 这里执行后等导航稳定（readyState + 固定 2s），由调用方判断"是否真的翻页成功"
-	// （用 URL/首卡片指纹变化）。返回 true 仅表示"点了 / 尝试了"。
-	w.ExecJS(clickNextPageJS)
-	return true
+	out, err := w.ExecJSResult(clickNextPageJS, 5*time.Second)
+	if err != nil {
+		// 读不回（超时 / 旧 WebView2 运行时无 ICoreWebView2_21）→ 退化为盲点，保持旧语义。
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[ClickNextPage] ExecJSResult 读回失败，退化为盲点：%v", err))
+		}
+		w.ExecJS(clickNextPageJS)
+		return true
+	}
+	// clickNextPageJS 返回 1/0（数字），GetResultAsJson 读回为 "1"/"0"。
+	trimmed := strings.TrimSpace(out)
+	if trimmed == "1" {
+		return true
+	}
+	// "0"（到底 / 没下一页）或其他 → 明确没翻成。
+	return false
 }
 
 // SetURL 把子窗口导航到指定 URL（用于双窗编排：detail 窗逐个访问 item.Url）。

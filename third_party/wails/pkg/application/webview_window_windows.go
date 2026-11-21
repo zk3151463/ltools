@@ -452,6 +452,21 @@ func (w *windowsWebviewWindow) execJS(js string) {
 	})
 }
 
+// execJSResult runs js and reads back its JSON result synchronously (up to
+// timeout). Delegates to chromium.EvalWithResult (ICoreWebView2_21
+// .ExecuteScriptWithResult COM callback). Runs on the main thread, like execJS.
+func (w *windowsWebviewWindow) execJSResult(js string, timeout time.Duration) (string, error) {
+	if w.chromium == nil {
+		return "", fmt.Errorf("webview not initialized")
+	}
+	var out string
+	var outErr error
+	globalApplication.dispatchOnMainThread(func() {
+		out, outErr = w.chromium.EvalWithResult(js, timeout)
+	})
+	return out, outErr
+}
+
 func (w *windowsWebviewWindow) setBackgroundColour(color RGBA) {
 	switch w.parent.options.BackgroundType {
 	case BackgroundTypeSolid:

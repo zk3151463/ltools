@@ -9,6 +9,11 @@ import type {} from "../github.com/wailsapp/wails/v3/internal/eventdata.js";
 import "../github.com/wailsapp/wails/v3/internal/eventcreate.js";
 
 /**
+ * Name of the custom event "c1688:item".
+ */
+export const C1688Item = "c1688:item";
+
+/**
  * Name of the custom event "c1688:log".
  */
 export const C1688Log = "c1688:log";

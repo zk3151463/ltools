@@ -4,6 +4,7 @@ package application
 
 import (
 	"fmt"
+	"time"
 	"unsafe"
 
 	"github.com/wailsapp/wails/v3/pkg/events"
@@ -60,6 +61,9 @@ func (b *BrowserWindow) Close()                                       {}
 func (b *BrowserWindow) DisableSizeConstraints()                      {}
 func (b *BrowserWindow) EnableSizeConstraints()                       {}
 func (b *BrowserWindow) ExecJS(js string)                             {}
+func (b *BrowserWindow) ExecJSResult(js string, timeout time.Duration) (string, error) {
+	return "", fmt.Errorf("ExecJSResult not available on browser windows")
+}
 func (b *BrowserWindow) Focus()                                       {}
 func (b *BrowserWindow) ForceReload()                                 {}
 func (b *BrowserWindow) Fullscreen() Window                           { return b }

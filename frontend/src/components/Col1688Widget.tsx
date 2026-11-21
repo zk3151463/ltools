@@ -73,6 +73,16 @@ export function Col1688Widget() {
     const unsubResult = Events.On('c1688:result', (ev: any) => {
       setResults(ev?.data || [])
     })
+    // 单条供应商逐条累积（"一个一个返回"）：按 name+url 去重后 append，结果表实时加行。
+    const unsubItem = Events.On('c1688:item', (ev: any) => {
+      const it = ev?.data
+      if (!it || !it.name) return
+      setResults(prev => {
+        const exists = prev.some(r => r.name === it.name && r.url === it.url)
+        if (exists) return prev
+        return [...prev, it as Supplier]
+      })
+    })
     const unsubProgress = Events.On('c1688:progress', (ev: any) => {
       void ev
     })
@@ -88,6 +98,7 @@ export function Col1688Widget() {
     return () => {
       unsubLog?.()
       unsubResult?.()
+      unsubItem?.()
       unsubProgress?.()
       unsubState?.()
     }

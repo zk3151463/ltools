@@ -119,6 +119,14 @@ func (s *Collect1688Service) emitProgress() {
 	}
 }
 
+// emitItem 推送"单个"供应商到前端（c1688:item 事件，前端结果表逐行追加 = "一个一个返回"）。
+// 每页读回 items 后逐条调用，让结果表实时累积，而非整页一次刷出。
+func (s *Collect1688Service) emitItem(it Supplier) {
+	if s.app != nil {
+		_ = s.app.Event.Emit("c1688:item", it)
+	}
+}
+
 // Start 开始采集（browser 或 html 模式）。
 func (s *Collect1688Service) Start(opts CollectOptions) error {
 	s.mu.Lock()
@@ -411,8 +419,9 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 				s.logf(m)
 			})
 
-			// 累积去重（按名称+地址）
+			// 累积去重（按名称+地址）。记录本次新增项，稍后逐条推 c1688:item。
 			added := 0
+			var newItems []Supplier
 			s.mu.Lock()
 			for _, it := range items {
 				key := it.Name + "||" + it.Address
@@ -421,11 +430,17 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 				}
 				seenNames[key] = true
 				s.results = append(s.results, it)
+				newItems = append(newItems, it)
 				added++
 			}
 			all := make([]Supplier, len(s.results))
 			copy(all, s.results)
 			s.mu.Unlock()
+
+			// 逐个返回：本次新增项逐条推 c1688:item（前端结果表逐行实时追加）。
+			for _, it := range newItems {
+				s.emitItem(it)
+			}
 
 			// ---- 双窗编排：补电话（可选）----
 			// 对本页新加项里"有 URL 且未访问过"的，逐个 SetURL 到 detail 窗取电话。
@@ -519,7 +534,12 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 			}
 
 			s.logf("点「下一页」…")
-			s.engine.ClickNextPage()
+			// ClickNextPage 现走 ExecJSResult 读回：true=真点了，false=明确到底/没下一页。
+			// 读回失败时内部退化为盲点并返回 true（旧语义，靠指纹兜底）。
+			if !s.engine.ClickNextPage() {
+				s.logf("下一页明确未命中（翻页到底 / 无下一页），提前结束")
+				break
+			}
 			// 等导航稳定 + 翻页间隔（防风控）
 			time.Sleep(delay)
 			// 再等 1s 让 bridge 重注 + 新文档加载

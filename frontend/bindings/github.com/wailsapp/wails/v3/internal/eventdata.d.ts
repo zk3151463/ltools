@@ -18,6 +18,7 @@ import type * as col1688$0 from "../../../../../ltools/plugins/col1688/models.js
 declare module "@wailsio/runtime" {
     namespace Events {
         interface CustomEvents {
+            "c1688:item": col1688$0.Supplier;
             "c1688:log": col1688$0.LogEntry;
             "c1688:page-html": { [_ in string]?: string };
             "c1688:progress": { [_ in string]?: number };

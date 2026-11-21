@@ -583,3 +583,6 @@ func (w *serverWebviewWindow) snapAssist()                                      
 func (w *serverWebviewWindow) attachModal(modalWindow *WebviewWindow)              {}
 func (w *serverWebviewWindow) setContentProtection(enabled bool)                   {}
 func (w *serverWebviewWindow) setNonClientHitTestRegions([]nonClientHitTestRegion) {}
+func (w *serverWebviewWindow) execJSResult(js string, timeout time.Duration) (string, error) {
+	return "", errors.New("ExecJSResult not available in server mode")
+}
