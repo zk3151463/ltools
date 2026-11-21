@@ -41,10 +41,6 @@ export function Col1688Widget() {
   const [exportPath, setExportPath] = useState('')
   const [windowOpen, setWindowOpen] = useState(false)
   const [collecting, setCollecting] = useState(false)
-  // 关键词 + 类别（Go 代搜：拼 1688 站内搜索 URL 直接 SetURL，避免手敲搜索框跨域冒窗）
-  const [keyword, setKeyword] = useState('')
-  const [category, setCategory] = useState<'factory' | 'supplier' | 'industry' | 'offer'>('factory')
-  const [searching, setSearching] = useState(false)
 
   const logRef = useRef<HTMLDivElement>(null)
   const runningRef = useRef(false)
@@ -96,28 +92,9 @@ export function Col1688Widget() {
     try {
       await Col1688Service.OpenLogin()
       setWindowOpen(true)
-      success(t('已打开 1688 子窗口首页（可先登录）'))
+      success(t('已打开 1688 子窗口首页（在子窗口里手动登录 / 输入关键词 / 选类别）'))
     } catch (e: any) {
       showError(t('打开 1688 失败：') + String(e))
-    }
-  }
-
-  // 方案 C（Go 代搜）：关键词 + 类别 → 拼 1688 站内搜索 URL 直接 SetURL 到子窗口，
-  // 避免用户手敲搜索框 → 跨域表单提交 login.1688.com → WebView2 COM 层冒新窗口。
-  const handleSearch = async () => {
-    if (!keyword.trim()) {
-      info(t('请先输入搜索关键词'))
-      return
-    }
-    setSearching(true)
-    try {
-      await Col1688Service.OpenSearch(keyword.trim(), category)
-      setWindowOpen(true)
-      success(t('已打开搜索页，子窗口里手动点供应商/翻页/调地区，勿用页面内搜索框'))
-    } catch (e: any) {
-      showError(t('打开搜索页失败：') + String(e))
-    } finally {
-      setSearching(false)
     }
   }
 
@@ -226,10 +203,9 @@ export function Col1688Widget() {
           <section className="glass rounded-xl p-4">
             <div className="text-sm font-semibold text-white/70 mb-2">{t('使用步骤')}</div>
             <ol className="text-[11px] leading-5 text-white/45 list-decimal list-inside space-y-1">
-              <li>{t('点「打开 1688」先到首页登录（如已登录可跳过）')}</li>
-              <li>{t('在下方输入关键词 + 选类别，点「搜索」——由程序直接打开搜索结果页（子窗口内加载，不开新窗）')}</li>
-              <li>{t('在子窗口里手动点供应商卡片 / 翻页 / 调地区（勿用页面内搜索框，它会跳登录页开新窗）')}</li>
-              <li>{t('列表加载好后，点「采集当前页」读取数据')}</li>
+              <li>{t('点「打开 1688」到首页登录（如已登录可跳过）')}</li>
+              <li>{t('在子窗口里手动输入关键词 + 选类别/地区 + 点供应商卡片/翻页')}</li>
+              <li>{t('列表加载好后，点「采集当前页」读取数据（可重复翻页多次采集）')}</li>
               <li>{t('最后点「导出 CSV」保存结果')}</li>
             </ol>
             <p className="text-[11px] text-white/30 mt-3">
@@ -239,46 +215,17 @@ export function Col1688Widget() {
 
           {/* 控制条 */}
           <section className="glass rounded-xl p-4">
-            {/* 关键词 + 类别 + 搜索（Go 代搜，避免手敲搜索框跨域冒窗） */}
-            <div className="flex gap-2 mb-3">
-              <input
-                type="text"
-                value={keyword}
-                onChange={(e) => setKeyword(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') handleSearch() }}
-                placeholder={t('输入搜索关键词（如：帽子 / 工厂）')}
-                className="flex-1 min-w-0 bg-black/20 border border-white/10 rounded-lg px-3 py-2 text-sm text-white/90 placeholder:text-white/25 outline-none focus:border-[#A78BFA]"
-              />
-              <select
-                value={category}
-                onChange={(e) => setCategory(e.target.value as 'factory' | 'supplier' | 'industry' | 'offer')}
-                className="bg-black/20 border border-white/10 rounded-lg px-2 py-2 text-sm text-white/70 outline-none focus:border-[#A78BFA] cursor-pointer"
-              >
-                <option value="factory">{t('找工厂')}</option>
-                <option value="supplier">{t('找供应商')}</option>
-                <option value="industry">{t('行业')}</option>
-                <option value="offer">{t('找货源')}</option>
-              </select>
-              <button
-                onClick={handleSearch}
-                disabled={searching || !keyword.trim()}
-                className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium bg-gradient-to-r from-[#7C3AED] to-[#A78BFA] text-white hover:opacity-90 shadow-lg shadow-[#7C3AED]/20 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
-              >
-                <Icon name="funnel" size={15} />
-                {searching ? t('打开中…') : t('搜索')}
-              </button>
-            </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-              <CtrlBtn onClick={handleOpen1688} icon="external-link" disabled={collecting || searching} accent>
+              <CtrlBtn onClick={handleOpen1688} icon="external-link" disabled={collecting} accent>
                 {windowOpen ? t('已打开 1688') : t('打开 1688')}
               </CtrlBtn>
-              <CtrlBtn onClick={handleClose1688} icon="close" disabled={!windowOpen || collecting || searching}>
+              <CtrlBtn onClick={handleClose1688} icon="close" disabled={!windowOpen || collecting}>
                 {t('关闭子窗口')}
               </CtrlBtn>
               <CtrlBtn onClick={handleCollect} icon="funnel" disabled={!windowOpen || collecting} accent>
                 {collecting ? t('采集中…') : t('采集当前页')}
               </CtrlBtn>
-              <CtrlBtn onClick={handleDumpDiagnosis} icon="camera" disabled={!windowOpen || collecting || searching}>
+              <CtrlBtn onClick={handleDumpDiagnosis} icon="camera" disabled={!windowOpen || collecting}>
                 {t('导出诊断')}
               </CtrlBtn>
               <CtrlBtn onClick={handleExport} icon="download" disabled={results.length === 0}>

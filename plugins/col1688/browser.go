@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -50,6 +53,16 @@ type windowEngine struct {
 	// logf 日志钩子，由 service 注入（engine 自身不持有 store/app 日志通道）。
 	// 允许为 nil（OnCreate 回调里做 nil 检查）。
 	logf func(string)
+
+	// htmlServer 是子窗口回传 HTML 的本地回环 HTTP 服务。
+	// 关键约束：1688 子窗口是**外部站点**，Wails 不把 window.ltools（runtime）注入外部页，
+	// 且 Wails v3.1 的 ExecJS 是 void（Go 读不回 JS 结果）。因此"页面→Go"的唯一稳健通道
+	// 是让外部页 fetch POST 到 127.0.0.1:<port>（https 页发 http 127.0.0.1 是允许的，
+	// body-only fetch 不触发 CORS 阻塞；CORS 只拦"读响应"，POST 本身送达）。
+	// collectReq 由 CollectCurrentPage 在触发回传前打开，收集到 HTML 后关闭。
+	htmlServer   *http.Server
+	htmlServerMu sync.Mutex
+	collectReq   chan pageHTMLPayload
 }
 
 // pageHTMLPayload 子窗口回传的页面 HTML 载荷。
@@ -66,6 +79,7 @@ func newWindowEngine(app *application.App, diagDir string) *windowEngine {
 		diagDir:    diagDir,
 		pageHTMLCh: make(chan pageHTMLPayload, 16),
 		bridgeStop: make(chan struct{}),
+		collectReq: make(chan pageHTMLPayload, 4),
 	}
 }
 
@@ -108,6 +122,115 @@ func (e *windowEngine) registerEvents() {
 		default:
 		}
 	})
+}
+
+// htmlReturnPort 子窗口回传 HTML 的固定本地回环端口。
+// 固定端口便于 bridgeJS 硬编码；被占用时 startHTMLReturn 会报错并记日志（不影响主流程，
+// 采集退化为"无数据"，前端仍可用 html 粘贴模式降级）。
+const htmlReturnPort = 48217
+
+// startHTMLReturn 启动本地回环 HTTP 服务，接收子窗口 fetch POST 的 HTML。
+// 在 engine 创建时（NewCollect1688Service）调用一次。
+//
+// 通道原理（外部页 → Go 的唯一稳健路）：
+//   - 1688 子窗口是 https 外部页，Wails 不注入 window.ltools，ExecJS 又是 void。
+//   - 让页面 JS（bridgeJS 注入的 __ltoolsCollect）发 fetch POST 到 http://127.0.0.1:48217/c1688/html。
+//   - https 页向 http 127.0.0.1 发起 **body-only fetch** 不受 mixed-content 完全阻断
+//     （浏览器允许 127.0.0.1 的混合内容作为本地回环例外；即便个别浏览器拦，
+//     也优于"完全无法回传"）。POST 送达后 handler 读 body → 推 collectReq。
+//   - 加 Access-Control-Allow-Origin:* + 简单 POST（Content-Type: text/plain，
+//     不触发 CORS preflight），让"读响应"也不被 CORS 卡。
+func (e *windowEngine) startHTMLReturn() {
+	e.htmlServerMu.Lock()
+	defer e.htmlServerMu.Unlock()
+	if e.htmlServer != nil {
+		return // 已启动
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", htmlReturnPort))
+	if err != nil {
+		if e.logf != nil {
+			e.logf("HTML 回传端口 " + fmt.Sprintf("%d", htmlReturnPort) + " 启动失败：" + err.Error() + "（采集将无数据，可用粘贴 HTML 模式）")
+		}
+		return
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/c1688/html", e.htmlReturnHandler)
+	srv := &http.Server{Handler: mux}
+	e.htmlServer = srv
+	go func() {
+		_ = srv.Serve(ln)
+	}()
+	if e.logf != nil {
+		e.logf(fmt.Sprintf("HTML 回传服务已启动（127.0.0.1:%d）", htmlReturnPort))
+	}
+}
+
+// htmlReturnHandler 接收子窗口 POST 的 HTML 载荷，推给正在等待的 collectReq。
+// 响应加 CORS 头（允许外部 https 页读回 200，避免 CORS 报错影响后续 fetch）。
+func (e *windowEngine) htmlReturnHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	b, err := readBody(r, 5_000_000) // 上限 5MB，防超大页
+	if err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("read body failed"))
+		return
+	}
+	var p pageHTMLPayload
+	if err := json.Unmarshal(b, &p); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("bad json"))
+		return
+	}
+	// 推给正在等待的 CollectCurrentPage；若无人在等则丢弃（channel 有缓冲兜底）。
+	select {
+	case e.collectReq <- p:
+	default:
+		select {
+		case e.pageHTMLCh <- p:
+		default:
+		}
+	}
+	if _, werr := w.Write([]byte("ok")); werr != nil {
+		return
+	}
+}
+
+// readBody 读 body，超限返回错误。
+func readBody(r *http.Request, limit int64) ([]byte, error) {
+	defer r.Body.Close()
+	if limit <= 0 {
+		limit = 5_000_000
+	}
+	lr := io.LimitReader(r.Body, limit+1)
+	data, err := io.ReadAll(lr)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("body exceeds limit %d", limit)
+	}
+	return data, nil
+}
+
+// htmlReturnURL 返回子窗口 fetch 应 POST 的地址。
+func (e *windowEngine) htmlReturnURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d/c1688/html", htmlReturnPort)
+}
+
+// stopHTMLReturn 停止回传服务（进程退出时调用）。
+func (e *windowEngine) stopHTMLReturn() {
+	e.htmlServerMu.Lock()
+	defer e.htmlServerMu.Unlock()
+	if e.htmlServer != nil {
+		_ = e.htmlServer.Close()
+		e.htmlServer = nil
+	}
 }
 
 // registerWindowGuard 注册"窗口创建"全局钩子（Wails 公开 API WindowManager.OnCreate）。
@@ -181,6 +304,13 @@ func (e *windowEngine) drainChannel() {
 			return
 		}
 	}
+}
+
+// jsStringLiteral 把 Go string 编成可安全嵌入 JS 的字符串字面量（双引号 + 转义）。
+// 用于 ExecJS 注入常量（如回传 URL），避免手拼导致注入 / 转义问题。
+func (e *windowEngine) jsStringLiteral(s string) string {
+	b, _ := json.Marshal(s) // 返回带引号的 JSON 字符串，即合法 JS 字符串字面量
+	return string(b)
 }
 
 // getStr 从 map[string]any 里取 string 字段（缺失返回空串）。
@@ -263,6 +393,10 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 		AlwaysOnTop:   false,
 		Frameless:     false,
 		DisableResize: false,
+		// 子窗口背景：加载前/空白页显白色（避免 WebView2 默认暗色底透出，与"首页偏暗"相关）。
+		// 这是 Wails 公开选项（BackgroundColour），无需 patch Wails。
+		BackgroundType: application.BackgroundTypeSolid,
+		BackgroundColour: application.NewRGB(255, 255, 255),
 		// 治本：WebView2 COM 层 NewWindowRequested（target=_blank / window.open / <a target>）
 		// 在此拦截——不冒第二个窗，而是把目标 URL 导回当前子窗口内跳转（w.SetURL）。
 		// 主窗口不传此选项，故主窗口不受影响。详见 Wails patch（third_party/wails）。
@@ -335,28 +469,6 @@ func (e *windowEngine) OpenLogin() error {
 	return e.OpenWindow(context.Background(), "https://www.1688.com/")
 }
 
-// TestNewWindowIntercept 诊断：开子窗口到 data: URL，触发一次 window.open('_blank')，
-// 等 COM 层 NewWindowRequested 回调，再报告子窗口数量（应恒为 1，无第二窗）。
-// 仅用于验证 patch 生效，正式构建可删除。
-func (e *windowEngine) TestNewWindowIntercept(ctx context.Context) string {
-	if err := e.OpenWindow(ctx, "data:text/html;charset=utf-8,<html><body onload='window.open(%22https://www.1688.com%22%2C%20%22_blank%22)'><script>setTimeout(function(){window.open(%22https://detail.1688.com%2Foffer%2F1.html%22,%20%22_blank%22)},500)</script></body></html>"); err != nil {
-		return "open failed: " + err.Error()
-	}
-	time.Sleep(4 * time.Second)
-	// 统计当前所有窗口（主窗 + 子窗 + 任何 COM 冒出的窗）。
-	all := e.app.Window.GetAll()
-	subCount, total := 0, len(all)
-	for _, ww := range all {
-		if ww != nil && ww.Name() == e.name {
-			subCount++
-		}
-	}
-	if e.logf != nil {
-		e.logf(fmt.Sprintf("[诊断] 触发 2 次 window.open('_blank')；总窗口数=%d，同名子窗(c1688-window)数=%d（应=1）。若日志还出现\"拦截新窗口请求\"即 patch 生效，无第二窗", total, subCount))
-	}
-	return fmt.Sprintf("totalWindows=%d, subWindowCount=%d", total, subCount)
-}
-
 // CloseLogin 关闭子窗口。
 func (e *windowEngine) CloseLogin() {
 	e.CloseWindow()
@@ -386,10 +498,28 @@ const bridgeJS = `
   window.__ltoolsBridgeInstalled = true;
 
   // ---- 1. 数据回传 ----
+  // 外部 1688 页没有 window.ltools（Wails 不注入外部站），且 ExecJS 是 void 读不回结果。
+  // 主通道：fetch POST 到 Go 端本地回环（window.__ltoolsCollectURL，由 install 循环注入），
+  // https 页向 http 127.0.0.1 发 body-only fetch 允许；响应不读（规避 CORS 读响应限制）。
+  // 兜底通道：若有 window.ltools（内部页 / dev），走 Wails 事件；再退 parent.postMessage。
   window.__ltoolsCollect = function() {
     try {
       const html = document.documentElement.outerHTML || "";
       const payload = { url: location.href, title: document.title, html: html };
+      const target = window.__ltoolsCollectURL;
+      if (target && window.fetch) {
+        // body-only：不读 response（避免 CORS 读响应报错），送达即成功。
+        // Content-Type: text/plain → 简单请求，不触发 preflight。
+        try {
+          fetch(target, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body: JSON.stringify(payload),
+            keepalive: true,
+          }).catch(function(){});
+        } catch (e) {}
+        return 'fetch';
+      }
       if (window.ltools && window.ltools.Events && window.ltools.Events.Emit) {
         window.ltools.Events.Emit('c1688:page-html', payload);
         return 'sent';
@@ -516,6 +646,35 @@ const bridgeJS = `
 })();
 `
 
+// lightColorSchemeJS 强制子窗口浅色渲染，抑制 WebView2 对未声明 color-scheme 页面的
+// 自动暗色化（auto-darken）——这是"1688 首页偏暗"的根因。幂等：已注入则不重复。
+// 整页导航销毁 JS 后由 install 循环（80ms）重注，覆盖"导航完成瞬间"的空窗。
+const lightColorSchemeJS = `
+(function(){
+  try {
+    var rs = document.documentElement.style;
+    if (rs) { rs.colorScheme = 'light'; }
+    var meta = document.querySelector('meta[name="color-scheme"]');
+    if (!meta) {
+      meta = document.createElement('meta');
+      meta.name = 'color-scheme';
+      meta.content = 'light';
+      document.head.appendChild(meta);
+    } else if (meta.content !== 'light') {
+      meta.content = 'light';
+    }
+    // 兜底：给 html/body 显式浅色，防 1688 某些容器用 dark 变量
+    var s = document.getElementById('__ltools_light_css__');
+    if (!s) {
+      s = document.createElement('style');
+      s.id = '__ltools_light_css__';
+      s.textContent = ':root{color-scheme:light;} html,body{background:#fff;}';
+      document.head.appendChild(s);
+    }
+  } catch (e) {}
+})();
+`
+
 // installBridge 在子窗口里**持久**注入 bridgeJS（数据回传 + 导航拦截）。
 // Wails 子窗口是独立 WebView；bridge 通过 Wails 全局事件总线回传。
 // 用 currentWindow() 实时取窗口句柄（而非 e.win 字段），避免多实例 / 过期引用。
@@ -546,7 +705,13 @@ func (e *windowEngine) installBridge() {
 			}
 		} else {
 			missingTicks = 0
+			// 先注入回传目标 URL（整页导航会销毁 window，需随 bridge 一起周期重注），再注 bridge。
+			w.ExecJS("window.__ltoolsCollectURL=" + e.jsStringLiteral(e.htmlReturnURL()) + ";")
 			w.ExecJS(bridgeJS)
+			// 防暗色：WebView2 在 PrefLight 未声明时可能对页面做自动暗色化（auto-darken），
+			// 让 1688 白底页变灰暗。这里强制 :root color-scheme=light + 注入 <meta>，
+			// 整页导航后随 bridge 一起重注（幂等）。
+			w.ExecJS(lightColorSchemeJS)
 		}
 		time.Sleep(80 * time.Millisecond)
 	}
@@ -566,8 +731,10 @@ func (e *windowEngine) closeBridgeLoop() {
 }
 
 // CollectCurrentPage 对子窗口当前页执行提取：注入 __ltoolsCollect → 子窗口把 HTML 通过
-// c1688:page-html 事件回传 → 本方法阻塞等待该事件 → parseHTML 解析 → 返回 []Supplier。
-// 超时（8s）返回 nil。
+// **本地回环 HTTP**（127.0.0.1:48217/c1688/html，见 startHTMLReturn）POST 回 Go →
+// 本方法阻塞等待 collectReq → parseHTML 解析 → 返回 []Supplier。
+// 兜底：Wails 事件 c1688:page-html（pageHTMLCh）仍保留，若子窗口是内部页（有 window.ltools）
+// 也能走事件回传。外部页主要走 HTTP 回传。超时（8s）返回 nil。
 func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, logf func(string)) []Supplier {
 	w, ok := e.currentWindow()
 	if !ok {
@@ -577,48 +744,30 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 		return nil
 	}
 
-	// 先清掉 channel 里可能残留的旧 payload
+	// 清空两个回传通道里可能残留的旧 payload（防上一次的 HTML 串到本次）
 	e.drainChannel()
+	e.drainCollectReq()
 
-	// 触发子窗口执行 __ltoolsCollect
+	// 触发子窗口执行 __ltoolsCollect（它会 fetch POST 到本地回环）
 	w.ExecJS(`if (window.__ltoolsCollect) window.__ltoolsCollect();`)
 
-	// 等待回传事件
+	// 等待回传（HTTP 通道优先，事件通道兜底）
 	select {
+	case p := <-e.collectReq:
+		return e.finishCollect(p, source, logf)
 	case p := <-e.pageHTMLCh:
-		if p.HTML == "" {
-			if logf != nil {
-				logf("子窗口回传 HTML 为空（页面可能未加载或被 baxia 拦截）")
-			}
-			return nil
-		}
-		if logf != nil {
-			logf(fmt.Sprintf("收到子窗口 HTML：url=%s title=%q (%d 字符)", p.URL, p.Title, len(p.HTML)))
-		}
-		items := parseHTML(p.HTML, source, 0)
-		if logf != nil {
-			logf(fmt.Sprintf("解析到 %d 条", len(items)))
-		}
-		return items
+		return e.finishCollect(p, source, logf)
 	case <-time.After(8 * time.Second):
-		// 超时：再试一次（事件可能在 ExecJS 前就发出了，被 channel 错过）
+		// 超时：再试一次（fetch 可能慢 / 事件在 ExecJS 前发出被错过）
 		w.ExecJS(`if (window.__ltoolsCollect) window.__ltoolsCollect();`)
 		select {
+		case p := <-e.collectReq:
+			return e.finishCollect(p, source, logf)
 		case p := <-e.pageHTMLCh:
-			if p.HTML == "" {
-				if logf != nil {
-					logf("子窗口回传 HTML 为空（第二次尝试仍空）")
-				}
-				return nil
-			}
-			items := parseHTML(p.HTML, source, 0)
-			if logf != nil {
-				logf(fmt.Sprintf("解析到 %d 条（重试）", len(items)))
-			}
-			return items
+			return e.finishCollect(p, source, logf)
 		case <-time.After(3 * time.Second):
 			if logf != nil {
-				logf("子窗口回传 HTML 超时；请确认子窗口已加载 1688 页面且未被拦截")
+				logf("子窗口回传 HTML 超时；请确认子窗口已加载 1688 页面且未被拦截（回传走 127.0.0.1:48217）")
 			}
 			return nil
 		}
@@ -627,6 +776,35 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 			logf("已取消")
 		}
 		return nil
+	}
+}
+
+// finishCollect 把收到的 HTML 载荷解析成供应商并记日志。
+func (e *windowEngine) finishCollect(p pageHTMLPayload, source string, logf func(string)) []Supplier {
+	if p.HTML == "" {
+		if logf != nil {
+			logf("子窗口回传 HTML 为空（页面可能未加载或被 baxia 拦截）")
+		}
+		return nil
+	}
+	if logf != nil {
+		logf(fmt.Sprintf("收到子窗口 HTML：url=%s title=%q (%d 字符)", p.URL, p.Title, len(p.HTML)))
+	}
+	items := parseHTML(p.HTML, source, 0)
+	if logf != nil {
+		logf(fmt.Sprintf("解析到 %d 条", len(items)))
+	}
+	return items
+}
+
+// drainCollectReq 清空 collectReq 残留。
+func (e *windowEngine) drainCollectReq() {
+	for {
+		select {
+		case <-e.collectReq:
+		default:
+			return
+		}
 	}
 }
 

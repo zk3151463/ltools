@@ -61,6 +61,8 @@ func NewCollect1688Service(app *application.App, dataDir string) *Collect1688Ser
 	svc.engine.SetLogf(svc.logf)
 	// 注册子窗口回传 HTML 的事件监听 + 窗口创建兜底（必须在任何 OpenWindow 之前）
 	svc.engine.registerEvents()
+	// 启动子窗口 HTML 回传的本地回环 HTTP 服务（外部页 fetch POST 回来；必须在 OpenWindow 前）
+	svc.engine.startHTMLReturn()
 	return svc
 }
 
@@ -231,16 +233,6 @@ func (s *Collect1688Service) OpenSearch(keyword, category string) error {
 		s.logf("子窗口已打开 1688 首页（未带关键词，可先登录）")
 	}
 	return nil
-}
-
-// TestNewWindowIntercept 诊断：验证 Wails patch（OnNewWindowRequest）是否生效。
-// 开子窗口到 data: URL，触发 2 次 window.open('_blank')，等 4s 后统计窗口数。
-// 期望 totalWindows 不随 window.open 增长（COM 层被拦截，导回当前子窗口），
-// 且日志出现"拦截新窗口请求"。仅用于验证，正式构建可删除本方法。
-func (s *Collect1688Service) TestNewWindowIntercept() string {
-	res := s.engine.TestNewWindowIntercept(context.Background())
-	s.logf("[诊断结果] " + res)
-	return res
 }
 
 // categoryOrDefault 返回类别的中文标签（日志用），未知回退 offer。
