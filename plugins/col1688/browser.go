@@ -672,11 +672,12 @@ const bridgeJS = `
         // CSP 兜底：fetch 被 CSP connect-src 拦截（127.0.0.1 不在白名单）时走 sendBeacon（items）/
         // Image（items 序列化为 query），两者都不受 connect-src 限制。
         const doFallback = function() {
+          var beaconOk = false, imgOk = false;
           try {
             // sendBeacon：items JSON 通常 < 64KB，够用；html 太大放不进，仅回传 items。
             if (navigator.sendBeacon) {
               const blob = new Blob([JSON.stringify({ url: location.href, items: items })], { type: 'application/json' });
-              navigator.sendBeacon(target.replace(/\/c1688\/html$/, '/c1688/html') , blob);
+              beaconOk = navigator.sendBeacon(target, blob);
             }
           } catch (e) {}
           try {
@@ -684,7 +685,12 @@ const bridgeJS = `
             const img = new Image();
             const qs = encodeURIComponent(JSON.stringify({ url: location.href, items: items })).slice(0, 60000);
             img.src = target + '?b=' + qs;
+            imgOk = true;
           } catch (e) {}
+          // 记录兜底结果（Go 端读 window.__ltoolsCollectResult 判断通道）。
+          if (beaconOk) { window.__ltoolsCollectResult = 'beacon-ok'; }
+          else if (imgOk) { window.__ltoolsCollectResult = 'image-ok'; }
+          else { window.__ltoolsCollectResult = 'fallback-fail'; }
         };
         try {
           fetch(target, {
@@ -692,17 +698,32 @@ const bridgeJS = `
             headers: { 'Content-Type': 'text/plain' },
             body: JSON.stringify(payload),
             keepalive: true,
-          }).catch(doFallback);
-        } catch (e) { doFallback(); }
+          }).then(function() {
+            window.__ltoolsCollectResult = 'fetch-ok';
+          }).catch(function() {
+            doFallback();
+            window.__ltoolsCollectResult = 'fetch-fallback';
+          });
+        } catch (e) {
+          doFallback();
+          window.__ltoolsCollectResult = 'fetch-throw';
+        }
+        // 先返回 'fetch-pending'（fetch 是异步的，结果稍后写到 window.__ltoolsCollectResult）。
+        window.__ltoolsCollectResult = 'fetch-pending';
         return 'fetch';
       }
       if (window.ltools && window.ltools.Events && window.ltools.Events.Emit) {
         window.ltools.Events.Emit('c1688:page-html', payload);
+        window.__ltoolsCollectResult = 'wails-event';
         return 'sent';
       }
       try { parent.postMessage(payload, '*'); } catch(e) {}
+      window.__ltoolsCollectResult = 'postmessage';
       return 'post';
-    } catch (err) { return 'err:' + err; }
+    } catch (err) {
+      window.__ltoolsCollectResult = 'err:' + err;
+      return 'err:' + err;
+    }
   };
 
   // ---- 2. 导航拦截（强化：事件 + 原型 + window.open 三层全拦）----
@@ -1356,7 +1377,17 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 			return e.finishCollect(p, source, logf)
 		}
 	}
+	// 读回 __ltoolsCollectResult（简单属性，COM 快，不碰 RESOURCE_NOT_IN_CORRECT_STATE）。
+	// 用于诊断回传通道：fetch-ok / fetch-fallback / beacon-ok / image-ok / err:... / 空串。
+	time.Sleep(500 * time.Millisecond) // 等 fetch 异步完成（then/catch 回调写 result）
+	collectResult, collectResultErr := w.ExecJSResult(`window.__ltoolsCollectResult || ""`, 3*time.Second)
+	collectResult = strings.Trim(collectResult, `"`)
 	if logf != nil {
+		if collectResultErr != nil {
+			logf(fmt.Sprintf("[回传诊断] 读回 __ltoolsCollectResult 失败：%v（通道状态未知）", collectResultErr))
+		} else {
+			logf(fmt.Sprintf("[回传诊断] __ltoolsCollectResult=%s（url=%s）", collectResult, e.currentURLForLog()))
+		}
 		logf("子窗口回传 HTML 超时（3 次重试均失败）；请确认子窗口已加载 1688 页面且未被拦截（回传走 127.0.0.1:48217）。[diag] 日志见上。")
 	}
 	return nil
