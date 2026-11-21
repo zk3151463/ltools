@@ -1189,36 +1189,74 @@ func (e *windowEngine) collectItems(ctx context.Context) []Supplier {
 	if !ok {
 		return nil
 	}
+	// 0) 先确认页面稳定（document.readyState === "complete"），避免在导航/渲染期间
+	//    调 ExecuteScriptWithResult 碰 RESOURCE_NOT_IN_CORRECT_STATE（WebView2 内部状态不对）。
+	//    最多等 5s（10 × 500ms），超时仍尝试（1688 页 readyState 通常很快 complete）。
+	ready, readyErr := w.ExecJSResult(`document.readyState`, 3*time.Second)
+	if readyErr == nil && strings.TrimSpace(ready) != `"complete"` {
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[collectItems] 页面未 ready（readyState=%s），等 5s...", truncateStr(ready, 40)))
+		}
+		for i := 0; i < 10; i++ {
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+				}
+			}
+			time.Sleep(500 * time.Millisecond)
+			ready, readyErr = w.ExecJSResult(`document.readyState`, 3*time.Second)
+			if readyErr == nil && strings.TrimSpace(ready) == `"complete"` {
+				break
+			}
+		}
+	}
 	// 1) 先让取数脚本在当前文档跑一遍（幂等，整页导航后由 install 循环重注兜底）。
 	//    suppliersJS 末尾 collect() 会把结果写到 window.__ltoolsSuppliers。
-	// 2) 同步读回（COM 回调）。读回空 / 失败时重试 1 次（等 800ms 让 install 循环把
-	//    suppliersJS 重注进新文档 + JS 算好 __ltoolsSuppliers，覆盖"刚跳页 JS 还没就绪"）。
-	w.ExecJS(suppliersJS)
-	out, err := w.ExecJSResult(`window.__ltoolsSuppliers || "[]"`, 5*time.Second)
-	items, uerr := unmarshalSuppliers(out)
-	if len(items) == 0 && (err != nil || uerr != nil) {
-		if e.logf != nil {
-			e.logf(fmt.Sprintf("[ExecJSResult] 首次读回空/失败（err=%v uerr=%v raw=%s），800ms 后重试一次",
-				err, uerr, truncateStr(out, 120)))
+	// 2) 同步读回（COM 回调）。读回空 / 失败时重试（2s × 3 次，让 WebView2 从
+	//    RESOURCE_NOT_IN_CORRECT_STATE 恢复 + install 循环重注 suppliersJS）。
+	const maxAttempts = 3
+	const retryDelay = 2 * time.Second
+	var out string
+	var err error
+	var items []Supplier
+	var uerr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			if e.logf != nil {
+				e.logf(fmt.Sprintf("[collectItems] 第 %d 次重试（%v 后）...", attempt+1, retryDelay))
+			}
+			time.Sleep(retryDelay)
+			if ctx != nil {
+				select {
+				case <-ctx.Done():
+					return nil
+				default:
+				}
+			}
 		}
-		time.Sleep(800 * time.Millisecond)
 		w.ExecJS(suppliersJS)
 		out, err = w.ExecJSResult(`window.__ltoolsSuppliers || "[]"`, 5*time.Second)
 		items, uerr = unmarshalSuppliers(out)
+		if len(items) > 0 {
+			break
+		}
 	}
 	if err != nil {
 		if e.logf != nil {
 			// 诊断：区分三种根因
 			// ① "ICoreWebView2_21 not supported" → 老 WebView2 运行时（QueryInterface 失败）
 			// ② "EvalWithResult: timeout" → COM 回调线程模型问题（死锁/未派发）
-			// ③ 其它 → 提交失败 / JS 执行异常
-			e.logf(fmt.Sprintf("[ExecJSResult] 读回供应商数据失败（根因诊断）：%v", err))
+			// ③ "RESOURCE_NOT_IN_CORRECT_STATE" → WebView2 内部状态不对（导航/DPI/双窗）
+			e.logf(fmt.Sprintf("[ExecJSResult] 读回供应商数据失败（根因诊断，%d 次尝试）：%v",
+				maxAttempts, err))
 		}
 		return nil
 	}
 	if uerr != nil {
 		if e.logf != nil {
-			e.logf(fmt.Sprintf("[ExecJSResult] 解析供应商 JSON 失败（根因③：suppliersJS 没跑成功）：%v（raw=%s）",
+			e.logf(fmt.Sprintf("[ExecJSResult] 解析供应商 JSON 失败（根因：suppliersJS 没跑成功）：%v（raw=%s）",
 				uerr, truncateStr(out, 200)))
 		}
 		return nil

@@ -590,12 +590,14 @@ func (e *Chromium) EvalWithResult(script string, timeout time.Duration) chan Eva
 	// Retry is safe: if the error is persistent (UTF16 encode failure, etc.),
 	// the retry will fail immediately on the same condition and we exit after
 	// 3 total attempts. If transient, the backoff lets WebView2 settle.
-	const maxAttempts = 3
+	const maxAttempts = 2
 	var submitErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if attempt > 0 {
-			// Brief backoff + re-query the interface (previous ref may be stale).
-			time.Sleep(200 * time.Millisecond)
+			// Backoff: let WebView2 recover from RESOURCE_NOT_IN_CORRECT_STATE.
+			// 1s is enough for navigation/DPI to settle; 200ms was too short
+			// (WebView2 still in bad state → retry also fails).
+			time.Sleep(1 * time.Second)
 			wv21.Release()
 			wv21 = e.webview.GetICoreWebView2_21()
 			if wv21 == nil {
