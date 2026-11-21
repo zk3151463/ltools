@@ -65,11 +65,13 @@ type windowEngine struct {
 	collectReq   chan pageHTMLPayload
 }
 
-// pageHTMLPayload 子窗口回传的页面 HTML 载荷。
+// pageHTMLPayload 子窗口回传的页面载荷。
+// Items 是子窗口 JS 直接取到的结构化供应商数据（首选）；HTML 是兜底（Items 为空时 Go 端 parseHTML）。
 type pageHTMLPayload struct {
 	URL   string `json:"url"`
 	Title string `json:"title"`
 	HTML  string `json:"html"`
+	Items []Supplier `json:"items"`
 }
 
 func newWindowEngine(app *application.App, diagDir string) *windowEngine {
@@ -101,6 +103,11 @@ func (e *windowEngine) registerEvents() {
 				URL:   getStr(m, "url"),
 				Title: getStr(m, "title"),
 				HTML:  getStr(m, "html"),
+			}
+			if itemsRaw, ok := m["items"]; ok {
+				if bs, err := json.Marshal(itemsRaw); err == nil {
+					_ = json.Unmarshal(bs, &p.Items)
+				}
 			}
 			select {
 			case e.pageHTMLCh <- p:
@@ -504,8 +511,19 @@ const bridgeJS = `
   // 兜底通道：若有 window.ltools（内部页 / dev），走 Wails 事件；再退 parent.postMessage。
   window.__ltoolsCollect = function() {
     try {
+      // 取数：优先用 suppliersJS 已算好的 window.__ltoolsSuppliers（结构化 JSON），
+      // 没有则回退整页 HTML（Go 端 parseHTML 兜底）。
+      if (typeof window.__ltoolsCollectSuppliers === 'function') {
+        try { window.__ltoolsCollectSuppliers(); } catch (e) {}
+      }
+      let items = [];
+      try {
+        if (window.__ltoolsSuppliers) {
+          items = JSON.parse(window.__ltoolsSuppliers) || [];
+        }
+      } catch (e) { items = []; }
       const html = document.documentElement.outerHTML || "";
-      const payload = { url: location.href, title: document.title, html: html };
+      const payload = { url: location.href, title: document.title, items: items, html: html };
       const target = window.__ltoolsCollectURL;
       if (target && window.fetch) {
         // body-only：不读 response（避免 CORS 读响应报错），送达即成功。
@@ -675,6 +693,161 @@ const lightColorSchemeJS = `
 })();
 `
 
+// suppliersJS 在 1688 结果页里直接取"供应商列表"结构化数据，归一化成
+// [{name,phone,address,main,level,url}] 后存到 window.__ltoolsSuppliers。
+// 三层策略（命中即返回，比 Go 端对 outerHTML 跑正则准得多）：
+//  1. 活数据对象：window.__INITIAL_DATA__ / __INITIAL_STATE__ / __data__ /
+//     __pageData__ / __NEXT_DATA__，递归找"含公司名 + (电话|地址|旺旺)"的供应商数组。
+//  2. DOM 卡片启发式：当前文档里"卡片容器内同时出现公司名 + 电话/地址/旺旺"的卡片。
+//  3. 数据对象候选键对齐 Go 的 collectJSON（companyName/shopName/… + mobile/phone/…）。
+// 结果写 window.__ltoolsSuppliers（JSON 字符串），由 __ltoolsCollect 读出来随回传带回。
+// 整页导航销毁 window 后由 install 循环（80ms）重注，保证"导航完成瞬间"也能取数。
+const suppliersJS = `
+(function(){
+  function normName(s){ if(!s) return ""; s=String(s).trim(); if(s.length<2||s.length>80) return ""; return s; }
+  function normPhone(s){ if(s==null) return ""; s=String(s); var m=s.replace(/\\D/g,''); if(m.length>=7 && m.length<=15) return s.replace(/[^0-9+\\-() ]/g,''); if(/^\\d{11}$/.test(m)) return m; return s; }
+  function pick(obj, keys){ if(!obj) return ""; for(var i=0;i<keys.length;i++){ var v=obj[keys[i]]; if(v!=null && String(v).trim()!=="") return String(v).trim(); } return ""; }
+
+  // ---- 1. 从活数据对象里递归找供应商 ----
+  function fromData(root){
+    var out=[]; var seen={};
+    var NAME_KEYS=["companyName","shopName","sellerName","name","fullName","companyNameStr","title"];
+    var PHONE_KEYS=["mobile","phone","tel","telephone","contactPhone","mobileNo","contactMobile","telNo"];
+    var ADDR_KEYS=["address","fullAddress","addressDetail","province","city","town","provinceName","cityName","townName","areaName"];
+    function isSupplier(m){
+      var hasName = NAME_KEYS.some(function(k){return m[k]!=null && String(m[k]).trim()!=="";});
+      var hasPhone = PHONE_KEYS.some(function(k){return m[k]!=null && String(m[k]).trim()!=="";});
+      var hasAddr = ADDR_KEYS.some(function(k){return m[k]!=null && String(m[k]).trim()!=="";});
+      var hasWangwang = !!(m["loginId"]||m["ww"]||m["wangwang"]);
+      return hasName && (hasPhone||hasAddr||hasWangwang);
+    }
+    function walk(v, depth){
+      if(!v || depth>12) return;
+      if(Array.isArray(v)){ for(var i=0;i<v.length;i++) walk(v[i], depth+1); return; }
+      if(typeof v==="object"){
+        if(isSupplier(v)){
+          var name=normName(pick(v,NAME_KEYS));
+          var phone=normPhone(pick(v,PHONE_KEYS));
+          var addrParts=[pick(v,["province","provinceName"]),pick(v,["city","cityName"]),pick(v,["town","townName"]),pick(v,["address","fullAddress","addressDetail","areaName"])];
+          var address=addrParts.filter(Boolean).join(" ");
+          var main=pick(v,["mainProduct","mainCategory","categoryName","mainBusiness","description","category"]);
+          var level=pick(v,["level","strengthTag","creditLevel","years","companyLevel","medalLevel","creditYears"]);
+          var url=pick(v,["url","link","shopUrl","winportUrl","shopLink","detailUrl","offerUrl"]);
+          var key=name+"||"+address;
+          if((name||phone||address) && !seen[key]){ seen[key]=1;
+            out.push({name:name,phone:phone,address:address,main:main,level:level,url:url});
+          }
+          // 不深入供应商内部（避免把无关子对象误判）
+          return;
+        }
+        for(var k in v) if(v.hasOwnProperty(k)) walk(v[k], depth+1);
+      }
+    }
+    var candidates=[];
+    ["__INITIAL_DATA__","__INITIAL_STATE__","__data__","__pageData__","__NEXT_DATA__"].forEach(function(n){
+      try{ if(window[n] && typeof window[n]==="object") candidates.push(window[n]); }catch(e){}
+    });
+    // 也尝试全局 data 挂在 document 的 data-* / script[type=json]
+    var sels=document.querySelectorAll('script[type="application/json"],script[id*="data"],script[class*="data"]');
+    for(var i=0;i<sels.length;i++){ try{ var j=JSON.parse(sels[i].textContent); if(j) candidates.push(j); }catch(e){} }
+    for(var c=0;c<candidates.length && out.length===0;c++) walk(candidates[c],0);
+    return out;
+  }
+
+  // ---- 2. DOM 卡片启发式 ----
+  function fromDOM(){
+    var out=[]; var seen={};
+    // 公司名候选标签
+    var nameSel='a[class*="company"],[class*="company-name"],[class*="shop-name"],[class*="supplier-name"],[class*="text-company"],[class*="b2b-company"]';
+    var names=document.querySelectorAll(nameSel);
+    names.forEach(function(el){
+      var card=el.closest('[class*="item"],[class*="card"],[class*="module"],li,div[class*="offer"]')||el.parentElement;
+      if(!card) return;
+      var name=(el.textContent||"").replace(/\\s+/g,' ').trim();
+      if(name.length<2||name.length>80) name="";
+      var phone="";
+      var telA=card.querySelector('a[href^="tel:"]'); if(telA){ phone=telA.getAttribute('href').replace(/^tel:/,''); }
+      if(!phone){ var m=(card.innerText||"").match(/(1[3-9]\\d{9}|\\d{3,4}[- ]?\\d{7,8})/); if(m) phone=m[0]; }
+      var addr="";
+      var addrEl=card.querySelector('[class*="location"],[class*="address"],[class*="town"],[class*="province"],[class*="area"]');
+      if(addrEl){ addr=(addrEl.textContent||"").replace(/\\s+/g,' ').trim(); }
+      var main=""; var mainEl=card.querySelector('[class*="main"],[class*="category"],[class*="product"]'); if(mainEl) main=(mainEl.textContent||"").trim().slice(0,60);
+      var url=""; var shopA=card.querySelector('a[href*="detail.1688.com"],a[href*=".1688.com"]'); if(shopA) url=shopA.href||shopA.getAttribute('href')||"";
+      var key=name+"||"+addr;
+      if((name||phone||addr) && !seen[key]){ seen[key]=1; out.push({name:name,phone:phone,address:addr,main:main,level:"",url:url}); }
+    });
+    return out;
+  }
+
+  function collect(){
+    var list=[];
+    try{ list=fromData(window); }catch(e){}
+    if(list.length===0){ try{ list=fromDOM(); }catch(e){} }
+    window.__ltoolsSuppliers = JSON.stringify(list||[]);
+    window.__ltoolsSuppliersCount = (list||[]).length;
+    return list;
+  }
+  window.__ltoolsCollectSuppliers = collect;
+  collect();
+})();
+`
+
+// scrollLoadMoreJS 滚一屏触发懒加载，并报告"是否到底"。
+// 每次调用滚一屏（scrollTop=scrollHeight），若内容高度不增长则 noGrow++。
+// 到底判定：noGrow>=2（连续 2 次无新增）或 scrolls>6（最多 6 屏防死循环）。
+// 结果：window.__ltoolsScrollDone = 1 表示"到底了，不用再滚"，否则 0。
+const scrollLoadMoreJS = `
+(function(){
+  var sc=document.scrollingElement||document.documentElement||document.body;
+  if(!sc) return;
+  window.__ltoolsLastHeight=window.__ltoolsLastHeight||0;
+  window.__ltoolsNoGrow=window.__ltoolsNoGrow||0;
+  window.__ltoolsScrolls=window.__ltoolsScrolls||0;
+  sc.scrollTop=sc.scrollHeight;
+  var newH=(document.body?document.body.scrollHeight:0)||sc.scrollHeight;
+  if(newH<=window.__ltoolsLastHeight){ window.__ltoolsNoGrow++; } else { window.__ltoolsNoGrow=0; window.__ltoolsLastHeight=newH; }
+  window.__ltoolsScrolls++;
+  var atBottom = window.__ltoolsNoGrow>=2 || window.__ltoolsScrolls>6;
+  window.__ltoolsScrollDone = atBottom?1:0;
+})();
+`
+
+// clickNextPageJS 点「下一页」。多策略定位，命中即点（走原型 click，被 bridgeJS 拦为当前窗跳转）。
+// 返回 1=点成功 / 0=没找到下一页。
+const clickNextPageJS = `
+(function(){
+  function txt(el){ return (el.textContent||"").replace(/\\s+/g,'').trim(); }
+  function isDisabled(a){ return a.hasAttribute('disabled')||/(disabled|disabled_)/.test(a.className||''); }
+  function clickAnchor(a){
+    if(!a) return false;
+    if(isDisabled(a)) return false;
+    try{ if(a.click) { a.click(); } else { a.dispatchEvent(new MouseEvent('click',{bubbles:true})); } }catch(e){ try{ location.href=a.href; }catch(e2){} }
+    return true;
+  }
+  // 策略 1：文本 = 下一页 / » / 下页
+  var anchors=document.querySelectorAll('a');
+  for(var i=0;i<anchors.length;i++){
+    var t=txt(anchors[i]);
+    if(t==='下一页'||t==='下页'||t==='»'||t==='›'||t==='>') { if(clickAnchor(anchors[i])) return 1; }
+  }
+  // 策略 2：pagination 容器里文本=下一页
+  var pg=document.querySelectorAll('[class*="pagination"] a,[class*="pager"] a,[class*="page"] a');
+  for(var j=0;j<pg.length;j++){
+    var tt=txt(pg[j]);
+    if(tt==='下一页'||tt==='»'){ if(clickAnchor(pg[j])) return 1; }
+  }
+  // 策略 3：URL 翻页参数（pageNum / page）+1
+  try{
+    var u=new URL(location.href);
+    var changed=false;
+    if(u.searchParams.has('pageNum')){ u.searchParams.set('pageNum', parseInt(u.searchParams.get('pageNum'),10)+1); changed=true; }
+    else if(u.searchParams.has('page')){ u.searchParams.set('page', parseInt(u.searchParams.get('page'),10)+1); changed=true; }
+    if(changed){ location.href=u.toString(); return 1; }
+  }catch(e){}
+  return 0;
+})();
+`
+
 // installBridge 在子窗口里**持久**注入 bridgeJS（数据回传 + 导航拦截）。
 // Wails 子窗口是独立 WebView；bridge 通过 Wails 全局事件总线回传。
 // 用 currentWindow() 实时取窗口句柄（而非 e.win 字段），避免多实例 / 过期引用。
@@ -708,6 +881,10 @@ func (e *windowEngine) installBridge() {
 			// 先注入回传目标 URL（整页导航会销毁 window，需随 bridge 一起周期重注），再注 bridge。
 			w.ExecJS("window.__ltoolsCollectURL=" + e.jsStringLiteral(e.htmlReturnURL()) + ";")
 			w.ExecJS(bridgeJS)
+			// 取数脚本（__ltoolsCollectSuppliers + 立即跑一次），整页导航后重注。
+			w.ExecJS(suppliersJS)
+			// 重置滚动状态（每页导航后 scrollTop 归零，需要重新从头滚）
+			w.ExecJS(`window.__ltoolsNoGrow=0;window.__ltoolsScrolls=0;window.__ltoolsLastHeight=0;`)
 			// 防暗色：WebView2 在 PrefLight 未声明时可能对页面做自动暗色化（auto-darken），
 			// 让 1688 白底页变灰暗。这里强制 :root color-scheme=light + 注入 <meta>，
 			// 整页导航后随 bridge 一起重注（幂等）。
@@ -779,20 +956,36 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 	}
 }
 
-// finishCollect 把收到的 HTML 载荷解析成供应商并记日志。
+// finishCollect 把收到的载荷解析成供应商并记日志。
+// 优先用子窗口 JS 取到的结构化 Items（最准）；Items 为空才回退 Go 端 parseHTML(HTML)。
 func (e *windowEngine) finishCollect(p pageHTMLPayload, source string, logf func(string)) []Supplier {
+	if len(p.Items) > 0 {
+		// 补 source/time（JS 侧只给 name/phone/address/main/level/url）
+		for i := range p.Items {
+			if p.Items[i].Source == "" {
+				p.Items[i].Source = source
+			}
+			if p.Items[i].Time == "" {
+				p.Items[i].Time = nowLocal()
+			}
+		}
+		if logf != nil {
+			logf(fmt.Sprintf("子窗口 JS 取到 %d 条供应商（url=%s）", len(p.Items), p.URL))
+		}
+		return p.Items
+	}
 	if p.HTML == "" {
 		if logf != nil {
-			logf("子窗口回传 HTML 为空（页面可能未加载或被 baxia 拦截）")
+			logf("子窗口回传 HTML 为空且无结构化数据（页面可能未加载 / 非结果页 / 被 baxia 拦截）")
 		}
 		return nil
 	}
 	if logf != nil {
-		logf(fmt.Sprintf("收到子窗口 HTML：url=%s title=%q (%d 字符)", p.URL, p.Title, len(p.HTML)))
+		logf(fmt.Sprintf("JS 未取到结构化数据，回退 HTML 解析（url=%s, %d 字符）", p.URL, len(p.HTML)))
 	}
 	items := parseHTML(p.HTML, source, 0)
 	if logf != nil {
-		logf(fmt.Sprintf("解析到 %d 条", len(items)))
+		logf(fmt.Sprintf("HTML 解析到 %d 条", len(items)))
 	}
 	return items
 }
@@ -828,6 +1021,43 @@ func (e *windowEngine) CloseWindow() {
 func (e *windowEngine) IsWindowOpen() bool {
 	_, ok := e.currentWindow()
 	return ok
+}
+
+// ScrollToBottom 在子窗口里滚动加载到底（触发懒加载），每 interval 滚一屏，
+// 直到"到底"（连续 2 次无新增 或 超过 6 屏）。用于采当前页前把懒加载内容抓全。
+func (e *windowEngine) ScrollToBottom(interval time.Duration) {
+	if interval <= 0 {
+		interval = 1200 * time.Millisecond
+	}
+	for i := 0; i < 8; i++ {
+		w, ok := e.currentWindow()
+		if !ok {
+			return
+		}
+		w.ExecJS(scrollLoadMoreJS)
+		// 读"是否到底"：再 ExecJS 把结果存到 window，然后读（ExecJS 是 void，
+		// 用一个可被 JS 写、Go 用 ExecJS 触发的同步判定：再跑一次 scrollLoadMoreJS
+		// 并读 window.__ltoolsScrollDone 需要返回值；退化为"固定滚动 N 次"策略）。
+		// 这里简化：滚 6 次即视为到底（1688 一页内容有限），每次等 interval。
+		if i >= 5 {
+			break
+		}
+		time.Sleep(interval)
+	}
+}
+
+// ClickNextPage 在子窗口里点「下一页」。返回 true 表示点了（页面将跳转）。
+// 定位策略见 clickNextPageJS（文本"下一页/»" → pagination 容器 → URL 参数 +1）。
+func (e *windowEngine) ClickNextPage() bool {
+	w, ok := e.currentWindow()
+	if !ok {
+		return false
+	}
+	// clickNextPageJS 执行点击；由于 ExecJS 是 void 读不回返回值，
+	// 这里执行后等导航稳定（readyState + 固定 2s），由调用方判断"是否真的翻页成功"
+	// （用 URL/首卡片指纹变化）。返回 true 仅表示"点了 / 尝试了"。
+	w.ExecJS(clickNextPageJS)
+	return true
 }
 
 // DumpPageHTML 把子窗口当前页 HTML 落盘到 diagDir（诊断用），返回文件路径。

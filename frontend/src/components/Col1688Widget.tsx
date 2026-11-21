@@ -41,9 +41,20 @@ export function Col1688Widget() {
   const [exportPath, setExportPath] = useState('')
   const [windowOpen, setWindowOpen] = useState(false)
   const [collecting, setCollecting] = useState(false)
+  const [autoRunning, setAutoRunning] = useState(false)
+  const [pages, setPages] = useState(3)
+  const [delaySec, setDelaySec] = useState(2)
 
   const logRef = useRef<HTMLDivElement>(null)
   const runningRef = useRef(false)
+
+  // 自动采集运行中：监听 c1688:state 在 stopped/idle 时复位 autoRunning
+  useEffect(() => {
+    if (state === 'stopped' || state === 'idle') {
+      setAutoRunning(false)
+      setCollecting(false)
+    }
+  }, [state])
 
   // 监听运行态事件
   useEffect(() => {
@@ -123,6 +134,32 @@ export function Col1688Widget() {
       showError(t('采集失败：') + String(e))
     } finally {
       setCollecting(false)
+    }
+  }
+
+  // 自动多页采集：Go 端滚动加载 + 点下一页，共 pages 页，翻页间隔 delaySec。
+  const handleAutoCollect = async () => {
+    if (!windowOpen) {
+      info(t('请先点「打开 1688」并搜到结果页'))
+      return
+    }
+    if (autoRunning) return
+    setAutoRunning(true)
+    try {
+      await Col1688Service.StartPages({ Pages: pages, DelaySec: delaySec, Mode: 'browser', Keyword: '', Category: 'factory', Region: '', MaxCount: 0, HTML: '' })
+      success(t('已启动自动采集 ' + pages + ' 页，可在子窗口里手动干预（暂停用「停止」）'))
+    } catch (e: any) {
+      showError(t('启动自动采集失败：') + String(e))
+      setAutoRunning(false)
+    }
+  }
+
+  const handleStop = async () => {
+    try {
+      Col1688Service.Stop()
+      info(t('已请求停止自动采集'))
+    } catch (e: any) {
+      showError(t('停止失败：') + String(e))
     }
   }
 
@@ -216,16 +253,16 @@ export function Col1688Widget() {
           {/* 控制条 */}
           <section className="glass rounded-xl p-4">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
-              <CtrlBtn onClick={handleOpen1688} icon="external-link" disabled={collecting} accent>
+              <CtrlBtn onClick={handleOpen1688} icon="external-link" disabled={collecting || autoRunning} accent>
                 {windowOpen ? t('已打开 1688') : t('打开 1688')}
               </CtrlBtn>
-              <CtrlBtn onClick={handleClose1688} icon="close" disabled={!windowOpen || collecting}>
+              <CtrlBtn onClick={handleClose1688} icon="close" disabled={!windowOpen || collecting || autoRunning}>
                 {t('关闭子窗口')}
               </CtrlBtn>
-              <CtrlBtn onClick={handleCollect} icon="funnel" disabled={!windowOpen || collecting} accent>
+              <CtrlBtn onClick={handleCollect} icon="funnel" disabled={!windowOpen || collecting || autoRunning} accent>
                 {collecting ? t('采集中…') : t('采集当前页')}
               </CtrlBtn>
-              <CtrlBtn onClick={handleDumpDiagnosis} icon="camera" disabled={!windowOpen || collecting}>
+              <CtrlBtn onClick={handleDumpDiagnosis} icon="camera" disabled={!windowOpen || collecting || autoRunning}>
                 {t('导出诊断')}
               </CtrlBtn>
               <CtrlBtn onClick={handleExport} icon="download" disabled={results.length === 0}>
@@ -233,6 +270,40 @@ export function Col1688Widget() {
               </CtrlBtn>
               <CtrlBtn onClick={copyAll} icon="copy" disabled={results.length === 0}>
                 {t('复制全部')}
+              </CtrlBtn>
+            </div>
+
+            {/* 自动多页采集 */}
+            <div className="mt-3 grid grid-cols-1 sm:grid-cols-4 gap-2 items-center">
+              <label className="flex items-center gap-2 text-xs text-white/50">
+                {t('页数')}
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={pages}
+                  onChange={e => setPages(Math.max(1, Math.min(20, Number(e.target.value) || 1)))}
+                  disabled={autoRunning}
+                  className="w-14 px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white text-xs focus:outline-none focus:border-[#A78BFA] disabled:opacity-40"
+                />
+              </label>
+              <label className="flex items-center gap-2 text-xs text-white/50">
+                {t('翻页间隔(秒)')}
+                <input
+                  type="number"
+                  min={1}
+                  max={30}
+                  value={delaySec}
+                  onChange={e => setDelaySec(Math.max(1, Math.min(30, Number(e.target.value) || 1)))}
+                  disabled={autoRunning}
+                  className="w-14 px-2 py-1.5 rounded-lg bg-white/5 border border-white/10 text-white text-xs focus:outline-none focus:border-[#A78BFA] disabled:opacity-40"
+                />
+              </label>
+              <CtrlBtn onClick={handleAutoCollect} icon="play" disabled={!windowOpen || autoRunning || collecting} accent className="sm:col-span-2">
+                {autoRunning ? t('自动采集中…') : t('自动采集 ' + pages + ' 页')}
+              </CtrlBtn>
+              <CtrlBtn onClick={handleStop} icon="close" disabled={!autoRunning} className="sm:col-span-1">
+                {t('停止')}
               </CtrlBtn>
             </div>
             {exportPath && (

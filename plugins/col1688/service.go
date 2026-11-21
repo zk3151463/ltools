@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
@@ -300,6 +302,156 @@ func (s *Collect1688Service) Stop() {
 	s.mu.Unlock()
 	s.wg.Wait()
 	s.logf("已停止")
+}
+
+// StartPages 自动多页采集（Go 端编排）：
+// 用户在子窗口里先手动搜到结果页（登录/关键词/类别），然后点本按钮，
+// 程序自动：滚到底 → 取当前页数据 → 点下一页 → 翻页间隔 DelaySec → 重复，共 Pages 页。
+// 全程在子窗口内（COM 拦截保证不冒新窗）。累积去重结果，每页推 c1688:progress。
+//
+// opts.Pages 0 或缺省 → 3 页；opts.DelaySec 0 → 2s；opts.MaxCount 0 → 不限。
+// 若某页"卡住"（连续 2 页无新增数据，说明翻页没成功 / 到底了）→ 提前停。
+// 返回 nil（结果走 c1688:result 事件 + GetResults）。
+func (s *Collect1688Service) StartPages(opts CollectOptions) error {
+	s.mu.Lock()
+	if s.running {
+		s.mu.Unlock()
+		return errors.New("已有采集任务在运行")
+	}
+	if !s.engine.IsWindowOpen() {
+		s.mu.Unlock()
+		return errors.New("子窗口未打开；请先点「打开 1688」并搜到结果页")
+	}
+	s.running = true
+	s.paused = false
+	s.state = StateRunning
+	s.results = nil
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	ctx := s.ctx
+	s.mu.Unlock()
+
+	pages := opts.Pages
+	if pages <= 0 {
+		pages = 3
+	}
+	if pages > 20 {
+		pages = 20 // 上限，防误填
+	}
+	delay := time.Duration(opts.DelaySec) * time.Second
+	if delay <= 0 {
+		delay = 2 * time.Second
+	}
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer func() {
+			s.mu.Lock()
+			s.running = false
+			s.state = StateStopped
+			s.mu.Unlock()
+			s.emitState()
+		}()
+
+		s.logf(fmt.Sprintf("开始自动采集 %d 页（翻页间隔 %s）", pages, delay))
+		seenNames := map[string]bool{}
+		var lastFingerprint string
+		stuckCount := 0
+
+		for p := 1; p <= pages; p++ {
+			select {
+			case <-ctx.Done():
+				s.logf("已取消自动采集")
+				return
+			default:
+			}
+
+			s.logf(fmt.Sprintf("第 %d/%d 页：滚动加载…", p, pages))
+			s.engine.ScrollToBottom(1200 * time.Millisecond)
+
+			src := fmt.Sprintf("子窗口 第%d页", p)
+			items := s.engine.CollectCurrentPage(ctx, src, func(m string) {
+				s.logf(m)
+			})
+
+			// 累积去重（按名称+地址）
+			added := 0
+			s.mu.Lock()
+			for _, it := range items {
+				key := it.Name + "||" + it.Address
+				if key == "||" || seenNames[key] {
+					continue
+				}
+				seenNames[key] = true
+				s.results = append(s.results, it)
+				added++
+			}
+			all := make([]Supplier, len(s.results))
+			copy(all, s.results)
+			s.mu.Unlock()
+
+			s.logf(fmt.Sprintf("第 %d/%d 页：新增 %d 条，累计 %d 条", p, pages, added, len(all)))
+			if s.app != nil {
+				_ = s.app.Event.Emit("c1688:result", all)
+			}
+			s.emitProgress()
+
+			// MaxCount 已满 → 停
+			if opts.MaxCount > 0 && len(all) >= opts.MaxCount {
+				s.logf(fmt.Sprintf("已达 MaxCount=%d，提前结束", opts.MaxCount))
+				s.store.Save(opts.Keyword, all)
+				return
+			}
+
+			// 卡住检测：本页指纹（前 5 条名称拼接）与上页相同 → 翻页没成功 / 到底了
+			fp := fingerprint(items)
+			if p > 1 && fp == lastFingerprint {
+				stuckCount++
+				if stuckCount >= 1 {
+					s.logf("连续页数据相同（翻页未成功或已到底），提前结束")
+					break
+				}
+			} else {
+				stuckCount = 0
+			}
+			lastFingerprint = fp
+
+			// 最后一页不翻页
+			if p == pages {
+				break
+			}
+
+			s.logf("点「下一页」…")
+			s.engine.ClickNextPage()
+			// 等导航稳定 + 翻页间隔（防风控）
+			time.Sleep(delay)
+			// 再等 1s 让 bridge 重注 + 新文档加载
+			time.Sleep(1 * time.Second)
+		}
+
+		s.mu.Lock()
+		final := make([]Supplier, len(s.results))
+		copy(final, s.results)
+		s.mu.Unlock()
+		s.store.Save(opts.Keyword, final)
+		if s.app != nil {
+			_ = s.app.Event.Emit("c1688:result", final)
+		}
+		s.logf(fmt.Sprintf("自动采集完成，共 %d 条", len(final)))
+		s.emitProgress()
+	}()
+	s.emitState()
+	return nil
+}
+
+// fingerprint 取一页数据前 5 条的名称做指纹（判断是否翻到相同页）。
+func fingerprint(items []Supplier) string {
+	var b strings.Builder
+	for i := 0; i < len(items) && i < 5; i++ {
+		b.WriteString(items[i].Name)
+		b.WriteByte('|')
+	}
+	return b.String()
 }
 
 // GetResults 取当前结果。
