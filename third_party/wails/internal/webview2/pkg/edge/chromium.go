@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -76,6 +75,12 @@ type Chromium struct {
 	navigationCompleted              *ICoreWebView2NavigationCompletedEventHandler
 	processFailed                    *ICoreWebView2ProcessFailedEventHandler
 	newWindowRequested               *ICoreWebView2NewWindowRequestedEventHandler
+
+	// evalDoneCh 是 EvalWithResult 的"COM 回调完成"信号，由主线程消息泵派发回调时 close。
+	// EvalWithResult 在主线程内用独立 goroutine 轮询它（回调能在当前消息泵循环里派发，
+	// 主线程不被等待卡住 → 不重演"InvokeSync 占主线程 → COM 回调永不派发"死锁）。
+	// 每个 EvalWithResult 调用前重建。
+	evalDoneCh chan struct{}
 
 	environment            *ICoreWebView2Environment
 	webview2RuntimeVersion string
@@ -482,15 +487,18 @@ func (e *Chromium) Eval(script string) {
 var ErrEvalTimeout = errors.New("EvalWithResult: timeout")
 
 // evalWithResultHandler 实现 iCoreWebView2ExecuteScriptWithResultCompletedHandlerImpl。
-// COM 回调时：读 result.GetResultAsJson() → 存到 h.out → wg.Done()。
-// 放堆上；生命周期由 evalWithResult 的 handlerAddRef 记账（COM Release 前不被 GC，
-// 同 Wails 现有 CompletedHandler 模式，见 com_refs.go）。
+// COM 回调时：读 result.GetResultAsJson() → 存到 h.out → close(h.done)。
+// 放堆上；生命周期由 handlerAddRef 记账（COM Release 前不被 GC，同 Wails 现有 CompletedHandler 模式，
+// 见 com_refs.go）。
+//
+// done 必须是主线程消息泵上的 channel（见 Chromium.evalDoneCh）：COM 回调在 Wails 主线程
+// 的消息泵里派发，close(done) 不阻塞主线程；EvalWithResult 在主线程内用独立 goroutine 轮询它。
 type evalWithResultHandler struct {
-	out *evalResult
-	wg  *sync.WaitGroup
+	out  *evalResult
+	done chan struct{}
 }
 
-// evalResult 承载一次 EvalWithResult 的结果，由 COM 回调写入、调用方在 wg 完成后读。
+// evalResult 承载一次 EvalWithResult 的结果，由 COM 回调写入、EvalWithResult 在 done 关闭后读。
 type evalResult struct {
 	res string
 	err error
@@ -503,7 +511,7 @@ func (h *evalWithResultHandler) QueryInterface(_ uintptr, object uintptr) uintpt
 }
 
 func (h *evalWithResultHandler) ExecuteScriptWithResultCompleted(errorCode uintptr, result *iCoreWebView2ExecuteScriptResult) uintptr {
-	defer h.wg.Done()
+	defer close(h.done)
 	if int32(errorCode) < 0 || result == nil {
 		h.out.err = fmt.Errorf("ExecuteScriptWithResult completed with HRESULT 0x%08x", uint32(errorCode))
 		return 0
@@ -536,6 +544,13 @@ func (h *evalWithResultHandler) ExecuteScriptWithResultCompleted(errorCode uintp
 
 // EvalWithResult 执行 JS 并同步读回结果（JSON 字符串）。
 // 调用方必须保证：同窗口同一时刻只有一个 EvalWithResult 在飞（col1688 的单窗口串行调用满足）。
+//
+// 线程模型（关键）：本方法在 **Wails 主线程** 里被调用（execJSResult 经
+// InvokeSync → dispatchOnMainThread 派发到主线程）。COM 回调也只能在主线程消息泵里派发。
+// 若"提交 COM 回调后让出主线程等 wg"（即 `go wg.Wait()` 然后 select 阻塞），主线程会被
+// 占住、消息泵停转 → 回调永不派发 → 必超时。所以这里用"主线程内独立 goroutine 轮询
+// evalDoneCh"：COM 回调由当前消息泵循环派发（主线程不被等待卡住），轮询 goroutine
+// （非主线程）读到 done 即返回结果；主线程内 time.After(timeout) 兜底超时。
 func (e *Chromium) EvalWithResult(script string, timeout time.Duration) (string, error) {
 	if e.webview == nil || e.shuttingDown {
 		return "", errors.New("webview not initialized or shutting down")
@@ -552,36 +567,42 @@ func (e *Chromium) EvalWithResult(script string, timeout time.Duration) (string,
 	}
 	defer wv21.Release()
 
+	// 重建完成信号 channel（每个调用独立；COM 回调在消息泵里 close 它）。
+	e.evalDoneCh = make(chan struct{})
+
 	// handler 放堆上（vtbl 指向包级静态 vtbl，impl 是 &handler 自身）；
 	// handlerAddRef 记账保证 COM Release 前不被 GC（同 Wails 现有 handler 模式）。
-	var wg sync.WaitGroup
-	wg.Add(1)
 	out := &evalResult{}
-	impl := &evalWithResultHandler{out: out, wg: &wg}
+	impl := &evalWithResultHandler{out: out, done: e.evalDoneCh}
 	handler := newICoreWebView2ExecuteScriptWithResultCompletedHandler(impl)
 	handlerAddRef(unsafe.Pointer(handler))
 	defer handlerRelease(unsafe.Pointer(handler))
 
-	// 等待 COM 回调完成，或超时。waiter goroutine 里 wg.Wait（不阻塞调用线程的 COM 消息泵）。
-	// 超时路径直接返回；迟到回调只会跑 wg.Done()（wg 计数归零后是 no-op），不再写 out
-	// （out 已被调用方持有并返回，无数据竞争）。
 	err := wv21.ExecuteScriptWithResult(script, handler)
 	if err != nil {
-		wg.Done() // 回调不会来了
+		close(e.evalDoneCh) // 回调不会来了（close 是幂等的，回调 close 时已关则此处 no-op）
 		return "", fmt.Errorf("ExecuteScriptWithResult: %w", err)
 	}
 
-	done := make(chan struct{})
+	// 主线程内等待：独立 goroutine 轮询 evalDoneCh（COM 回调在当前消息泵循环里派发并 close）。
+	// 轮询间隔 10ms（COM 派发延迟小，足够及时）；主线程的 time.After(timeout) 兜底。
+	result := make(chan evalResult, 1)
 	go func() {
-		wg.Wait()
-		close(done)
+		for {
+			select {
+			case <-e.evalDoneCh:
+				result <- *out
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+		}
 	}()
 	select {
-	case <-done:
+	case r := <-result:
+		return r.res, r.err
 	case <-time.After(timeout):
 		return "", ErrEvalTimeout
 	}
-	return out.res, out.err
 }
 
 func (e *Chromium) Show() error {

@@ -1191,19 +1191,29 @@ func (e *windowEngine) collectItems(ctx context.Context) []Supplier {
 	}
 	// 1) 先让取数脚本在当前文档跑一遍（幂等，整页导航后由 install 循环重注兜底）。
 	//    suppliersJS 末尾 collect() 会把结果写到 window.__ltoolsSuppliers。
+	// 2) 同步读回（COM 回调）。读回空 / 失败时重试 1 次（等 800ms 让 install 循环把
+	//    suppliersJS 重注进新文档 + JS 算好 __ltoolsSuppliers，覆盖"刚跳页 JS 还没就绪"）。
 	w.ExecJS(suppliersJS)
-	// 2) 同步读回（COM 回调）。给足 5s：JS 提取 + COM 回调往返。
 	out, err := w.ExecJSResult(`window.__ltoolsSuppliers || "[]"`, 5*time.Second)
+	items, uerr := unmarshalSuppliers(out)
+	if len(items) == 0 && (err != nil || uerr != nil) {
+		if e.logf != nil {
+			e.logf("[ExecJSResult] 首次读回空/失败，800ms 后重试一次（等 JS 上下文就绪）")
+		}
+		time.Sleep(800 * time.Millisecond)
+		w.ExecJS(suppliersJS)
+		out, err = w.ExecJSResult(`window.__ltoolsSuppliers || "[]"`, 5*time.Second)
+		items, uerr = unmarshalSuppliers(out)
+	}
 	if err != nil {
 		if e.logf != nil {
 			e.logf(fmt.Sprintf("[ExecJSResult] 读回供应商数据失败：%v", err))
 		}
 		return nil
 	}
-	items, err := unmarshalSuppliers(out)
-	if err != nil {
+	if uerr != nil {
 		if e.logf != nil {
-			e.logf(fmt.Sprintf("[ExecJSResult] 解析供应商 JSON 失败：%v（raw=%s）", err, truncateStr(out, 200)))
+			e.logf(fmt.Sprintf("[ExecJSResult] 解析供应商 JSON 失败：%v（raw=%s）", uerr, truncateStr(out, 200)))
 		}
 		return nil
 	}
