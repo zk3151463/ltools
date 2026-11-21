@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -121,10 +122,16 @@ func SetRawMessageHandler(fn func(message string)) {
 
 // dispatchRawMessage 由 main.go 的 RawMessageHandler 调用，把 message 分发给所有已注册的 handler。
 func DispatchRawMessage(message string) {
+	// 诊断：确认 DispatchRawMessage 被调用（log.Printf 走标准输出，task dev 可见）
+	log.Printf("[col1688] DispatchRawMessage called（len=%d）", len(message))
 	rawMsgMu.Lock()
 	handlers := make([]func(string), len(rawMsgHandlers))
 	copy(handlers, rawMsgHandlers)
 	rawMsgMu.Unlock()
+	if len(handlers) == 0 {
+		log.Printf("[col1688] DispatchRawMessage: no handlers registered!")
+		return
+	}
 	for _, h := range handlers {
 		h(message)
 	}
@@ -185,6 +192,10 @@ func (e *windowEngine) registerEvents() {
 // 消息格式：JSON.stringify({ url, title, html, items })——与 pageHTMLPayload 一致。
 // 用 "c1688" 或 JSON 对象特征过滤，非本插件的消息直接丢弃。
 func (e *windowEngine) handleRawMessage(message string) {
+	// 诊断：无条件打日志（确认 RawMessageHandler 是否被调用、消息内容是什么）
+	if e.logf != nil {
+		e.logf(fmt.Sprintf("[RawMsg] 收到 raw message（len=%d）：%s", len(message), truncateStr(message, 200)))
+	}
 	// 快速过滤：消息必须是 JSON 对象且含 "url" 或 "items" 或 "html" 字段
 	// （window.external.invoke 发的 c1688:page-html payload）
 	if !strings.HasPrefix(message, "{") {
@@ -193,10 +204,16 @@ func (e *windowEngine) handleRawMessage(message string) {
 	var p pageHTMLPayload
 	if err := json.Unmarshal([]byte(message), &p); err != nil {
 		// 不是本插件的消息（可能是其他窗口的 raw message），忽略
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[RawMsg] JSON 解析失败：%v（raw=%s）", err, truncateStr(message, 100)))
+		}
 		return
 	}
 	// 至少有一个字段非零才处理（避免空对象误触发）
 	if p.URL == "" && p.HTML == "" && len(p.Items) == 0 {
+		if e.logf != nil {
+			e.logf("[RawMsg] 字段全空，丢弃")
+		}
 		return
 	}
 	if e.logf != nil {
