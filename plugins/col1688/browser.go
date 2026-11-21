@@ -1331,9 +1331,15 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 	if logf != nil {
 		logf("同步读回未取到数据，回退 HTTP 回传通道（__ltoolsCollect）")
 	}
-	_ = w
 	e.drainChannel()
 	e.drainCollectReq()
+
+	// 强制重注 bridgeJS + suppliersJS + __ltoolsCollectURL（不等 install 循环，
+	// 覆盖"install 循环在 WebView2 bad state 时没注到"的场景）。等 500ms 让 JS 执行。
+	w.ExecJS(`window.__ltoolsCollectURL=` + e.jsStringLiteral(e.htmlReturnURL()) + `;`)
+	w.ExecJS(bridgeJS)
+	w.ExecJS(suppliersJS)
+	time.Sleep(500 * time.Millisecond)
 
 	// 3 次重试：8s + 3s + 3s。第二次超时后注入 diagnoseJS 探针。
 	for attempt := 0; attempt < 3; attempt++ {
