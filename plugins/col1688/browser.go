@@ -379,11 +379,13 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 	if url == "" {
 		url = "https://www.1688.com/"
 	}
-	// 注入 collectJS（唯一脚本）：取数 + 自动回传（window.external.invoke）+ 导航拦截 + 浅色渲染。
+	// 注入两个独立跨导航脚本（各 <12KB，AddScript 各调一次，避免 WebView2 单脚本超限静默丢弃）：
+	//   collectJS  = 取数（window.data.offerV2 精确路径）+ 自动回传（window.external.invoke）
+	//   navGuardJS = 导航拦截 + 浅色渲染
 	// 跨导航注入（AddScriptToExecuteOnDocumentCreated，每个新文档 JS 运行前都执行），
 	// 不经过 ExecJS COM 调用（不碰 RESOURCE_NOT_IN_CORRECT_STATE）。
-	edge.SetExtraInitScripts(collectJS)
-	log.Printf("[col1688] OpenWindow: ExtraInitScripts set（collectJS=%d）", len(collectJS))
+	edge.SetExtraInitScripts(collectJS, navGuardJS)
+	log.Printf("[col1688] OpenWindow: ExtraInitScripts set（collectJS=%d, navGuardJS=%d）", len(collectJS), len(navGuardJS))
 	win := e.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:          e.name,
 		Title:         "1688 搜索",
@@ -419,7 +421,7 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 		return fmt.Errorf("创建 1688 子窗口失败")
 	}
 	e.win = win
-	// collectJS 经 AddScriptToExecuteOnDocumentCreated 跨导航自动注入，无需 install 循环重注。
+	// collectJS + navGuardJS 经 AddScriptToExecuteOnDocumentCreated 跨导航自动注入，无需 install 循环重注。
 	return nil
 }
 
@@ -447,184 +449,74 @@ func (e *windowEngine) CloseLogin() {
 	e.CloseWindow()
 }
 
-// collectJS 注入到 1688 子窗口的**唯一**脚本（AddScriptToExecuteOnDocumentCreated 跨导航注入，
-// 每个新文档 JS 运行前都执行）。做四件事：
-//
-//  1. 取数（from1688Result / fromData / fromDOM 三层，命中即用）→ 整理为
-//     [{name,phone,address,main,level,url}] 存到 window.__ltoolsCollectItems。
-//  2. 自动回传：等 document.readyState==='complete' 或 window.data 就绪后，
-//     取数 + window.external.invoke(JSON.stringify({type:'c1688:collect', items, url, title}))
-//     经 Wails RawMessageHandler 回传 Go 端（不碰 ExecJS COM、不走 127.0.0.1 HTTP、
-//     不被 CSP 拦——chrome.webview.postMessage 是 WebView2 原生通道）。
-//  3. 导航拦截（click/submit/window.open/原型劫持三层全拦）：把"会开新窗口/跳出 1688"的
-//     意图全部改成当前窗口内跳转，降低 WebView2 COM 层 NewWindowRequested 触发频率
-//     （真正的兜底关窗靠 Go 端 OnCreate）。
-//  4. 浅色渲染（:root color-scheme=light + meta + 兜底 css）：抑制 WebView2 对未声明
-//     color-scheme 页面的 auto-darken（"1688 首页偏暗"根因）。
-//
-// 幂等：window.__ltoolsCollectInstalled 标记，同一文档内不重复装。整页导航后新文档
-// 销毁 JS 上下文，AddScriptToExecuteOnDocumentCreated 在每个新文档 JS 运行前自动重执行本脚本。
-// c1688:connected 握手：文档加载后立即发，Go 端据此确认子窗口通信通道已通。
-const collectJS = `
-(function(){
-  // ---- 幂等：本文档已装则直接返回（AddScript 每个新文档都执行，新文档上下文重置标记）----
-  if (window.__ltoolsCollectInstalled) return;
-  window.__ltoolsCollectInstalled = true;
-
-  // ---- c1688:connected 握手（确认 window.external.invoke 通道已通）----
-  if (!window.__ltoolsConnected && window.external && window.external.invoke) {
-    window.__ltoolsConnected = true;
-    try {
-      window.external.invoke(JSON.stringify({
-        type: 'c1688:connected',
-        url: location.href,
-        ts: Date.now()
-      }));
-    } catch (e) {}
-  }
-
-  // ---- 取数工具 ----
-  function normName(s){ if(!s) return ""; s=String(s).trim(); if(s.length<2||s.length>80) return ""; return s; }
-  function normPhone(s){ if(s==null) return ""; s=String(s); var m=s.replace(/\\D/g,''); if(m.length>=7 && m.length<=15) return s.replace(/[^0-9+\\-() ]/g,''); if(/^\\d{11}$/.test(m)) return m; return s; }
-  function pick(obj, keys){ if(!obj) return ""; for(var i=0;i<keys.length;i++){ var v=obj[keys[i]]; if(v!=null && String(v).trim()!=="") return String(v).trim(); } return ""; }
-
-  // ---- 1688 结果页专用（window.data / 哈希 css-modules 类）----
-  function from1688Result(){
-    var out=[]; var seen={};
-    var NAME_KEYS=["shopName","companyName","companyNameStr","sellerName","loginId","memberId","name"];
-    var ADDR_KEYS=["province","provinceName","city","cityName","town","townName","address","fullAddress","areaName","addressDetail"];
-    var URL_KEYS=["shopUrl","winportUrl","companyUrl","url","link","offerUrl"];
-    function pushItem(name, phone, address, main, level, shopUrl){
-      name=normName(name); phone=normPhone(phone);
-      address=address||""; main=main||""; level=level||""; shopUrl=shopUrl||"";
-      var key=name+"||"+address+"||"+shopUrl;
-      if(!key || key==="||") return;
-      if(seen[key]) return;
-      seen[key]=1;
-      out.push({name:name,phone:phone,address:address,main:main,level:level,url:shopUrl});
-    }
-    var dataObj = (typeof window.data === "object" && window.data) ? window.data : null;
-    if(dataObj){
-      var walk=function(v, depth){
-        if(!v || depth>10) return;
-        if(Array.isArray(v)){ for(var i=0;i<v.length;i++) walk(v[i], depth+1); return; }
-        if(typeof v==="object"){
-          var hasName = NAME_KEYS.some(function(k){ return v[k]!=null && String(v[k]).trim()!==""; });
-          if(hasName){
-            var name=normName(pick(v,NAME_KEYS));
-            var addrParts=[pick(v,ADDR_KEYS)];
-            var address=addrParts.filter(Boolean).join(" ");
-            var main=pick(v,["mainProduct","mainCategory","categoryName","mainBusiness","description"]);
-            var level=pick(v,["level","strengthTag","creditLevel","years","companyLevel","medalLevel","creditYears"]);
-            var url=pick(v,URL_KEYS);
-            if(name || address){ pushItem(name,"",address,main,level,url); }
-            return;
-          }
-          for(var k in v) if(v.hasOwnProperty(k)) walk(v[k], depth+1);
-        }
-      };
-      walk(dataObj, 0);
-    }
-    // 兜底：DOM 层（1688 结果页 css-modules 哈希类）
-    if(out.length===0){
-      var cards=document.querySelectorAll('[class^="offerList--"], [class^="gridCell--"], [class*="offerCard--"]');
-      cards.forEach(function(card){
-        var nameEl=card.querySelector('[class^="shopRow--"] a[title], a[title]');
-        var name = nameEl ? (nameEl.getAttribute("title")||nameEl.textContent||"").trim() : "";
-        name=normName(name);
-        var addr="";
-        var addrEl=card.querySelector('[class*="location"],[class*="addr"],[class*="town"],[class*="province"]');
-        if(addrEl){ addr=(addrEl.textContent||"").replace(/\\s+/g,' ').trim(); }
-        var urlEl=card.querySelector('a[href*=".1688.com"]');
-        var url = urlEl ? (urlEl.href||urlEl.getAttribute("href")||"") : "";
-        var mainEl=card.querySelector('[class*="title"],[class*="product"],[class*="main"]');
-        var main = mainEl ? (mainEl.textContent||"").trim().slice(0,60) : "";
-        if(name || addr || url){ pushItem(name,"",addr,main,"",url); }
-      });
-    }
-    return out;
-  }
-
-  // ---- 活数据对象递归找供应商 ----
-  function fromData(root){
-    var out=[]; var seen={};
-    var NAME_KEYS=["companyName","shopName","sellerName","name","fullName","companyNameStr","title"];
-    var PHONE_KEYS=["mobile","phone","tel","telephone","contactPhone","mobileNo","contactMobile","telNo"];
-    var ADDR_KEYS=["address","fullAddress","addressDetail","province","city","town","provinceName","cityName","townName","areaName"];
-    function isSupplier(m){
-      var hasName = NAME_KEYS.some(function(k){return m[k]!=null && String(m[k]).trim()!=="";});
-      var hasPhone = PHONE_KEYS.some(function(k){return m[k]!=null && String(m[k]).trim()!=="";});
-      var hasAddr = ADDR_KEYS.some(function(k){return m[k]!=null && String(m[k]).trim()!=="";});
-      var hasWangwang = !!(m["loginId"]||m["ww"]||m["wangwang"]);
-      return hasName && (hasPhone||hasAddr||hasWangwang);
-    }
-    function walk(v, depth){
-      if(!v || depth>12) return;
-      if(Array.isArray(v)){ for(var i=0;i<v.length;i++) walk(v[i], depth+1); return; }
-      if(typeof v==="object"){
-        if(isSupplier(v)){
-          var name=normName(pick(v,NAME_KEYS));
-          var phone=normPhone(pick(v,PHONE_KEYS));
-          var addrParts=[pick(v,["province","provinceName"]),pick(v,["city","cityName"]),pick(v,["town","townName"]),pick(v,["address","fullAddress","addressDetail","areaName"])];
-          var address=addrParts.filter(Boolean).join(" ");
-          var main=pick(v,["mainProduct","mainCategory","categoryName","mainBusiness","description","category"]);
-          var level=pick(v,["level","strengthTag","creditLevel","years","companyLevel","medalLevel","creditYears"]);
-          var url=pick(v,["url","link","shopUrl","winportUrl","shopLink","detailUrl","offerUrl"]);
-          var key=name+"||"+address;
-          if((name||phone||address) && !seen[key]){ seen[key]=1;
-            out.push({name:name,phone:phone,address:address,main:main,level:level,url:url});
-          }
-          return;
-        }
-        for(var k in v) if(v.hasOwnProperty(k)) walk(v[k], depth+1);
-      }
-    }
-    var candidates=[];
-    ["__INITIAL_DATA__","__INITIAL_STATE__","__data__","__pageData__","__NEXT_DATA__"].forEach(function(n){
-      try{ if(window[n] && typeof window[n]==="object") candidates.push(window[n]); }catch(e){}
-    });
-    var sels=document.querySelectorAll('script[type="application/json"],script[id*="data"],script[class*="data"]');
-    for(var i=0;i<sels.length;i++){ try{ var j=JSON.parse(sels[i].textContent); if(j) candidates.push(j); }catch(e){} }
-    for(var c=0;c<candidates.length && out.length===0;c++) walk(candidates[c],0);
-    return out;
-  }
-
-  // ---- DOM 卡片启发式 ----
-  function fromDOM(){
-    var out=[]; var seen={};
-    var nameSel='a[class*="company"],[class*="company-name"],[class*="shop-name"],[class*="supplier-name"],[class*="text-company"],[class*="b2b-company"]';
-    var names=document.querySelectorAll(nameSel);
-    names.forEach(function(el){
-      var card=el.closest('[class*="item"],[class*="card"],[class*="module"],li,div[class*="offer"]')||el.parentElement;
-      if(!card) return;
-      var name=(el.textContent||"").replace(/\\s+/g,' ').trim();
-      if(name.length<2||name.length>80) name="";
-      var phone="";
-      var telA=card.querySelector('a[href^="tel:"]'); if(telA){ phone=telA.getAttribute('href').replace(/^tel:/,''); }
-      if(!phone){ var m=(card.innerText||"").match(/(1[3-9]\\d{9}|\\d{3,4}[- ]?\\d{7,8})/); if(m) phone=m[0]; }
-      var addr="";
-      var addrEl=card.querySelector('[class*="location"],[class*="address"],[class*="town"],[class*="province"],[class*="area"]');
-      if(addrEl){ addr=(addrEl.textContent||"").replace(/\\s+/g,' ').trim(); }
-      var main=""; var mainEl=card.querySelector('[class*="main"],[class*="category"],[class*="product"]'); if(mainEl) main=(mainEl.textContent||"").trim().slice(0,60);
-      var url=""; var shopA=card.querySelector('a[href*="detail.1688.com"],a[href*=".1688.com"]'); if(shopA) url=shopA.href||shopA.getAttribute("href")||"";
-      var key=name+"||"+addr;
-      if((name||phone||addr) && !seen[key]){ seen[key]=1; out.push({name:name,phone:phone,address:addr,main:main,level:"",url:url}); }
-    });
-    return out;
-  }
-
-  // ---- 取数（全局函数，F12 可手动调 window.__ltoolsCollectItemsRefresh()）----
-  function collect(){
-    var list=[];
-    try{ list=from1688Result(); }catch(e){}
-    if(list.length===0){ try{ list=fromData(window); }catch(e){} }
-    if(list.length===0){ try{ list=fromDOM(); }catch(e){} }
-    window.__ltoolsCollectItems = list;
-    window.__ltoolsCollectItemsJSON = JSON.stringify(list||[]);
-    return list;
-  }
-  // 文档创建时立即跑一次（此时 1688 数据多半没到，结果空；后续自动回传轮询会重取）
-  collect();
+// collectJS 注入 1688 子窗口的跨导航脚本 A（AddScriptToExecuteOnDocumentCreated，每个新文档
+// JS 运行前执行）。只做取数 + 回传（导航拦截 + 浅色渲染在独立的 navGuardJS，两脚本各 <12KB，
+// 避免 WebView2 单脚本超限静默丢弃）：
+//
+//  1. 取数：1688 搜索结果页（s.1688.com/selloffer/offer_search.htm）数据在
+//     window.data.offerV2.response.data.OFFER.items[]，每条映射：
+//       - name     取 item.data.shop.text（店铺名）
+//       - url      取 item.data.shopAddition.shopLinkUrl（店铺链接）
+//       - bizType  取 item.data.bizType（店铺类型，放 level 字段透传）
+//     电话/地址搜索结果页没有，留空，由 Go 端详情页双窗口编排补齐。
+//     非搜索页（首页/登录页）读不到该路径 → 回传空数组。
+//  2. 自动回传：等 data 就绪（最多 10s，1s 间隔）→ window.external.invoke(JSON.stringify(
+//     {type:'c1688:collect', items, url, title})) 经 Wails RawMessageHandler 回传 Go 端。
+//
+// 幂等：window.__ltoolsCollectInstalled 标记；c1688:connected 握手确认通道已通。
+const collectJS = `
+(function(){
+  // ---- 幂等：本文档已装则直接返回（AddScript 每个新文档都执行，新文档上下文重置标记）----
+  if (window.__ltoolsCollectInstalled) return;
+  window.__ltoolsCollectInstalled = true;
+
+  // ---- c1688:connected 握手（确认 window.external.invoke 通道已通）----
+  if (!window.__ltoolsConnected && window.external && window.external.invoke) {
+    window.__ltoolsConnected = true;
+    try {
+      window.external.invoke(JSON.stringify({
+        type: 'c1688:connected',
+        url: location.href,
+        ts: Date.now()
+      }));
+    } catch (e) {}
+  }
+
+  // ---- 取数工具 ----
+  function normName(s){ if(!s) return ""; s=String(s).trim(); if(s.length<2||s.length>80) return ""; return s; }
+
+  // ---- 1688 搜索结果页取数（精确路径，唯一策略）----
+  function collect(){
+    var list=[];
+    var items=null;
+    try{
+      if (window.data && window.data.offerV2 && window.data.offerV2.response &&
+          window.data.offerV2.response.data && window.data.offerV2.response.data.OFFER &&
+          window.data.offerV2.response.data.OFFER.items) {
+        items = window.data.offerV2.response.data.OFFER.items;
+      }
+    }catch(e){}
+    if (items && items.length){
+      items.forEach(function(it){
+        try{
+          var d = it.data || it;
+          var shop = (d.shop && typeof d.shop === "object") ? d.shop : {};
+          var addition = (d.shopAddition && typeof d.shopAddition === "object") ? d.shopAddition : {};
+          var name = normName(shop.text || shop.name || shop.companyName || "");
+          var url = addition.shopLinkUrl || addition.url || "";
+          var bizType = String(d.bizType || it.bizType || "");
+          if(name || url){
+            list.push({name:name, phone:"", address:"", main:"", level:bizType, url:url});
+          }
+        }catch(e){}
+      });
+    }
+    window.__ltoolsCollectItems = list;
+    window.__ltoolsCollectItemsJSON = JSON.stringify(list||[]);
+    return list;
+  }
+  // 文档创建时立即跑一次（此时 1688 数据多半没到，结果空；后续自动回传轮询会重取）
+  collect();
   window.__ltoolsCollectItemsRefresh = collect;
 
   // ---- 自动回传：等数据就绪再取 + invoke（不靠 Go 端 ExecJS 触发）----
@@ -656,9 +548,26 @@ const collectJS = `
     if (window.external && window.external.invoke) {
       try { window.external.invoke(JSON.stringify(payload)); } catch(e){}
     }
-  }, 1000);
+  }, 1000);
+})();`
+
+// navGuardJS 注入 1688 子窗口的第二个跨导航脚本（与 collectJS 独立，AddScript 各调一次，
+// 单脚本体积 < 12KB 避免 WebView2 静默丢弃）。做两件事：
+//
+//  1. 导航拦截（click/submit/window.open/原型劫持三层全拦）：把“会开新窗口/跳出 1688”的
+//     意图全部改成当前窗口内跳转，降低 WebView2 COM 层 NewWindowRequested 触发频率
+//     （真正的兜底关窗靠 Go 端 OnCreate）。
+//  2. 浅色渲染（:root color-scheme=light + meta + 兜底 css）：抑制 WebView2 对未声明
+//     color-scheme 页面的 auto-darken（“1688 首页偏暗”根因）。
+//
+// 幂等：window.__ltoolsNavInstalled 标记，同一文档内不重复装；与 collectJS 幂等独立。
+const navGuardJS = `
+(function(){
+  if (window.__ltoolsNavInstalled) return;
+  window.__ltoolsNavInstalled = true;
+
+  // ---- 导航拦截（事件 + 原型 + window.open 三层全拦）----
 
-  // ---- 导航拦截（事件 + 原型 + window.open 三层全拦，保留）----
   const is1688 = function(u){
     if (!u) return true;
     try { return /(^|\\.)1688\\.com$/i.test(new URL(u, location.href).hostname); } catch(e){ return true; }
