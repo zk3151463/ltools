@@ -593,6 +593,7 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 	//   window.external={invoke:...}; <ExtraInitScript>
 	// col1688 用 ExtraInitScript 注入 bridgeJS（__ltoolsCollect + c1688:connected）+ suppliersJS。
 	edge.SetExtraInitScript(bridgeJS + "\n" + suppliersJS)
+	log.Printf("[col1688] OpenWindow: ExtraInitScript set（len=%d）", len(bridgeJS)+len(suppliersJS))
 	win := e.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:          e.name,
 		Title:         "1688 搜索",

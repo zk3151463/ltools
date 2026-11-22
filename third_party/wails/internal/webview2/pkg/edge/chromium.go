@@ -448,6 +448,14 @@ func (e *Chromium) Init(script string) {
 	if e.webview == nil || e.shuttingDown {
 		return
 	}
+	// 诊断日志：确认 initScript 是否包含 ExtraInitScript（bridgeJS）
+	// 前 100 字符 + 总长度，用于判断 col1688 的 bridgeJS 是否被注入
+	log.Printf("[WebView2] Init script（len=%d, head=%s...）", len(script), func() string {
+		if len(script) > 100 {
+			return script[:100]
+		}
+		return script
+	}())
 	err := e.webview.AddScriptToExecuteOnDocumentCreated(script, nil)
 	if err != nil {
 		log.Printf("[WebView2] Init script registration failed: %v", err)
