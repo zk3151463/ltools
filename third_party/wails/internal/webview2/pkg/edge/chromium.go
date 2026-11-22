@@ -21,11 +21,16 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// ExtraInitScript 是应用层可设置的额外初始化脚本。
-// 在 WebView2 初始化完成后，与 window.external.invoke 一起通过
-// AddScriptToExecuteOnDocumentCreated 注入（跨导航，每个新文档都执行）。
-// col1688 插件用它注入 bridgeJS + suppliersJS（不经过 ExecJS COM 调用，不碰 bad state）。
-var ExtraInitScript string
+// ExtraInitScripts 是应用层可设置的多个额外初始化脚本（每个独立 AddScriptToExecuteOnDocumentCreated）。
+// 在 WebView2 初始化完成后，与 window.external.invoke 一起注入（跨导航，每个新文档都执行）。
+// col1688 插件用它注入 bridgeJS / suppliersJS（不经过 ExecJS COM 调用，不碰 bad state）。
+// 拆分多个小脚本规避单脚本超长被 WebView2 COM 静默丢弃。
+var ExtraInitScripts []string
+
+// SetExtraInitScripts 设置额外初始化脚本（供 pkg/edge 委托调用）。
+func SetExtraInitScripts(scripts ...string) {
+	ExtraInitScripts = scripts
+}
 
 type Rect = w32.Rect
 
@@ -296,15 +301,22 @@ func (e *Chromium) EmbedWithError(hwnd uintptr) (err error) {
 		}
 		return fmt.Errorf("WebView2 controller did not complete initialisation within %s", embedTimeout)
 	}
-	// 注入 window.external.invoke（Wails 框架层通信）+ ExtraInitScript（应用层额外脚本）。
-	// 关键：分多次 AddScriptToExecuteOnDocumentCreated 注册，互不影响。
+	// 注入 window.external.invoke（Wails 框架层通信）+ ExtraInitScripts（应用层额外脚本）。
+	// 关键：每个脚本独立 AddScriptToExecuteOnDocumentCreated 注册，互不影响。
 	//   - 第 1 个脚本只定义 window.external（Wails 核心通信），绝不能让应用脚本破坏它。
-	//   - 第 2 个脚本是 ExtraInitScript（col1688 的 bridgeJS + suppliersJS，约 15KB），包 try/catch，
-	//     抛错不影响已注入的 window.external，且错误存到 window.__ltoolsInitErr 供诊断。
-	//   - 每个脚本独立执行，避免"bridgeJS 语法错误 → 整个脚本（含 window.external）崩"的问题。
+	//   - 后续每个 ExtraInitScript 包 try/catch：抛错不影响已注入的 window.external，
+	//     且错误存到 window.__ltoolsInitErr（拼接各脚本错误）供诊断。
+	//   - 拆分多个小脚本（bridgeJS ~11KB / suppliersJS ~36KB 各自独立）规避单脚本超长被丢弃。
 	e.Init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}")
-	if ExtraInitScript != "" {
-		e.Init("window.__ltoolsInitErr='';try{" + ExtraInitScript + "}catch(e){window.__ltoolsInitErr=String(e)}")
+	if len(ExtraInitScripts) > 0 {
+		// 所有应用脚本包在同一个 try/catch 里（window.__ltoolsInitErr 记录哪个出错）
+		var sb strings.Builder
+		sb.WriteString("window.__ltoolsInitErr='';")
+		for i, s := range ExtraInitScripts {
+			// 每个片段独立 try/catch，一个崩不影响后面（但都记录到 __ltoolsInitErr）
+			sb.WriteString(fmt.Sprintf("try{%s}catch(e){window.__ltoolsInitErr=(window.__ltoolsInitErr?window.__ltoolsInitErr+';':'')+'s'+%d+':'+String(e)}", s, i))
+		}
+		e.Init(sb.String())
 	}
 	return nil
 }

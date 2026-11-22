@@ -57,6 +57,14 @@ type windowEngine struct {
 	// 允许为 nil（OnCreate 回调里做 nil 检查）。
 	logf func(string)
 
+	// lastPageHTML 缓存子窗口 window.external.invoke 自动回传的最近一次页面数据。
+	// 由 handleRawMessage（c1688:page-html）更新。用户点采集时，collectItems（ExecJSResult）
+	// 碰 bad state 失败后，直接返回此缓存（不再 ExecJS 触发 __ltoolsCollect，规避 bad state）。
+	// lastPageURL 记录缓存对应的 URL（翻页/搜索后新 URL 的数据会覆盖旧缓存）。
+	lastPageMu   sync.Mutex
+	lastPageHTML pageHTMLPayload
+	lastPageURL  string
+
 	// htmlServer 是子窗口回传 HTML 的本地回环 HTTP 服务。
 	// 关键约束：1688 子窗口是**外部站点**，Wails 不把 window.ltools（runtime）注入外部页，
 	// 且 Wails v3.1 的 ExecJS 是 void（Go 读不回 JS 结果）。因此"页面→Go"的唯一稳健通道
@@ -223,7 +231,7 @@ func (e *windowEngine) handleRawMessage(message string) {
 		}
 		return
 	}
-	// 无 type 字段或 type 为空 → 当作 page-html payload 处理
+	// c1688:page-html（__ltoolsCollect 自动/手动回传的数据）或无 type → 当 page-html payload 处理
 	var p pageHTMLPayload
 	if err := json.Unmarshal([]byte(message), &p); err != nil {
 		// 不是本插件的消息（可能是其他窗口的 raw message），忽略
@@ -242,10 +250,27 @@ func (e *windowEngine) handleRawMessage(message string) {
 	if e.logf != nil {
 		e.logf(fmt.Sprintf("[回传] 收到 %d 条供应商（url=%s）via window.external.invoke", len(p.Items), p.URL))
 	}
+	// 更新缓存：用户点采集时 collectItems（ExecJSResult）碰 bad state 失败后，
+	// 直接返回此缓存（不再 ExecJS 触发 __ltoolsCollect）。
+	e.lastPageMu.Lock()
+	e.lastPageHTML = p
+	e.lastPageURL = p.URL
+	e.lastPageMu.Unlock()
 	select {
 	case e.pageHTMLCh <- p:
 	default:
 	}
+}
+
+// lastPageHTMLSnapshot 返回最近一次自动回传的页面数据（缓存）。
+// 用户点采集时，collectItems（ExecJSResult）碰 bad state 失败后用它兜底。
+func (e *windowEngine) lastPageHTMLSnapshot() (pageHTMLPayload, string, bool) {
+	e.lastPageMu.Lock()
+	defer e.lastPageMu.Unlock()
+	if e.lastPageURL == "" {
+		return pageHTMLPayload{}, "", false
+	}
+	return e.lastPageHTML, e.lastPageURL, true
 }
 
 // htmlReturnPort 子窗口回传 HTML 的固定本地回环端口。
@@ -592,8 +617,11 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 	// Wails 框架层在 WebView2 初始化完成后调用 e.Init(initScript)，initScript 包含：
 	//   window.external={invoke:...}; <ExtraInitScript>
 	// col1688 用 ExtraInitScript 注入 bridgeJS（__ltoolsCollect + c1688:connected）+ suppliersJS。
-	edge.SetExtraInitScript(bridgeJS)
-	log.Printf("[col1688] OpenWindow: ExtraInitScript set（bridgeJS len=%d）", len(bridgeJS))
+	// bridgeJS（~11KB）和 suppliersJS（~36KB）各自独立 AddScriptToExecuteOnDocumentCreated 注入
+	// （跨导航，每个新文档执行），不经过 ExecJS COM 调用（不碰 bad state）。
+	// 拆分两个小脚本规避单脚本超长（之前 60KB 拼接被 WebView2 COM 静默丢弃）。
+	edge.SetExtraInitScripts(bridgeJS, suppliersJS)
+	log.Printf("[col1688] OpenWindow: ExtraInitScripts set（bridgeJS=%d, suppliersJS=%d）", len(bridgeJS), len(suppliersJS))
 	win := e.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:          e.name,
 		Title:         "1688 搜索",
@@ -787,7 +815,8 @@ const bridgeJS = `
         }
       } catch (e) { items = []; }
       const html = document.documentElement.outerHTML || "";
-      const payload = { url: location.href, title: document.title, items: items, html: html };
+      // type 字段让 Go 端 handleRawMessage 区分 page-html（区别于 c1688:connected）
+      const payload = { type: 'c1688:page-html', url: location.href, title: document.title, items: items, html: html };
       const target = window.__ltoolsCollectURL;
       // 首选：window.external.invoke（Wails 框架层 RawMessageHandler 接收，
       // WebView2 原生 chrome.webview.postMessage，不被 CSP 拦，不走 127.0.0.1）。
@@ -1001,6 +1030,29 @@ const lightColorSchemeJS = `
       document.head.appendChild(s);
     }
   } catch (e) {}
+
+  // ---- 自动采集：页面 ready 后自动执行 __ltoolsCollect（不靠手动 ExecJS，不碰 bad state）----
+  // 1688 搜索/翻页是整页导航（新文档），AddScript 每个新文档都会重新执行这段。
+  // document.readyState === 'complete' 时 DOM + 数据都加载完，自动采集当前页。
+  // 数据通过 window.external.invoke 回传（不碰 bad state），Go 端缓存最近一次。
+  // 用户点"采集"时 Go 端直接返回缓存（不再 ExecJS 触发，规避 RESOURCE_NOT_IN_CORRECT_STATE）。
+  // 防重复：window.__ltoolsAutoCollected（同一文档只自动采一次，导航后新文档重置）。
+  var autoCollect = function() {
+    if (window.__ltoolsAutoCollected) return;
+    window.__ltoolsAutoCollected = true;
+    try { window.__ltoolsCollect(); } catch (e) {}
+  };
+  if (document.readyState === 'complete') {
+    // 已 complete（AddScript 在 DOMContentLoaded 后执行）：延迟 800ms 等 1688 懒加载数据
+    setTimeout(autoCollect, 800);
+  } else {
+    // 加载中：等 complete 再采（多延迟 1.5s 给懒加载）
+    document.addEventListener('readystatechange', function() {
+      if (document.readyState === 'complete') {
+        setTimeout(autoCollect, 1500);
+      }
+    });
+  }
 })();
 `
 
@@ -1480,9 +1532,33 @@ func (e *windowEngine) CollectCurrentPage(ctx context.Context, source string, lo
 		return items
 	}
 
-	// ---- 兜底：HTTP 回传（__ltoolsCollect → fetch 127.0.0.1:48217）----
+	// ---- 兜底 1：取缓存（window.external.invoke 自动回传的最近一次数据，不碰 bad state）----
+	// 子窗口 bridgeJS 在页面 ready 后自动 __ltoolsCollect()，数据经 window.external.invoke
+	// 回传到 handleRawMessage → lastPageHTML 缓存。collectItems（ExecJSResult）碰 bad state
+	// 失败后，优先取此缓存（若缓存 URL 与当前页一致，直接用；若不一致，说明用户刚翻页，
+	// 缓存是旧页，继续走下面的 ExecJS 触发路径）。
+	if p, cachedURL, ok := e.lastPageHTMLSnapshot(); ok && len(p.Items) > 0 {
+		// 缓存命中且有条目：直接返回（不 ExecJS 触发，规避 bad state）。
+		// 即使 URL 不完全匹配（如翻页后旧缓存），也比 ExecJS 碰 bad state 强——
+		// 旧缓存的数据比"采集失败"有价值，用户可再点一次拿新页。
+		items := p.Items
+		for i := range items {
+			if items[i].Source == "" {
+				items[i].Source = source
+			}
+			if items[i].Time == "" {
+				items[i].Time = nowLocal()
+			}
+		}
+		if logf != nil {
+			logf(fmt.Sprintf("[缓存] 命中自动回传缓存（url=%s, %d 条供应商），直接返回（不经 ExecJS）", cachedURL, len(items)))
+		}
+		return items
+	}
+
+	// ---- 兜底 2：ExecJS 触发 __ltoolsCollect + 等回传（缓存未命中时）----
 	if logf != nil {
-		logf("同步读回未取到数据，回退 HTTP 回传通道（__ltoolsCollect）")
+		logf("缓存未命中，回退 ExecJS 触发 __ltoolsCollect（window.external.invoke 回传）")
 	}
 	e.drainChannel()
 	e.drainCollectReq()
