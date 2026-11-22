@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wailsapp/wails/v3/pkg/edge"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -586,6 +587,12 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 	if url == "" {
 		url = "https://www.1688.com/"
 	}
+	// 设置 edge.ExtraInitScript：bridgeJS + suppliersJS 通过 AddScriptToExecuteOnDocumentCreated
+	// 跨导航注入（每个新文档都执行），不经过 ExecJS COM 调用（不碰 RESOURCE_NOT_IN_CORRECT_STATE）。
+	// Wails 框架层在 WebView2 初始化完成后调用 e.Init(initScript)，initScript 包含：
+	//   window.external={invoke:...}; <ExtraInitScript>
+	// col1688 用 ExtraInitScript 注入 bridgeJS（__ltoolsCollect + c1688:connected）+ suppliersJS。
+	edge.SetExtraInitScript(bridgeJS + "\n" + suppliersJS)
 	win := e.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:          e.name,
 		Title:         "1688 搜索",

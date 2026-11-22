@@ -21,6 +21,12 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// ExtraInitScript 是应用层可设置的额外初始化脚本。
+// 在 WebView2 初始化完成后，与 window.external.invoke 一起通过
+// AddScriptToExecuteOnDocumentCreated 注入（跨导航，每个新文档都执行）。
+// col1688 插件用它注入 bridgeJS + suppliersJS（不经过 ExecJS COM 调用，不碰 bad state）。
+var ExtraInitScript string
+
 type Rect = w32.Rect
 
 func globalErrorHandler(err error) {
@@ -290,7 +296,14 @@ func (e *Chromium) EmbedWithError(hwnd uintptr) (err error) {
 		}
 		return fmt.Errorf("WebView2 controller did not complete initialisation within %s", embedTimeout)
 	}
-	e.Init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}")
+	// 注入 window.external.invoke（Wails 框架层通信）+ ExtraInitScript（应用层额外脚本）。
+	// ExtraInitScript 是跨导航的（AddScriptToExecuteOnDocumentCreated），每个新文档都执行。
+	// col1688 用它注入 bridgeJS + suppliersJS，不经过 ExecJS COM 调用（不碰 bad state）。
+	initScript := "window.external={invoke:s=>window.chrome.webview.postMessage(s)}"
+	if ExtraInitScript != "" {
+		initScript += ";" + ExtraInitScript
+	}
+	e.Init(initScript)
 	return nil
 }
 
