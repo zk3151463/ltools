@@ -308,15 +308,15 @@ func (e *Chromium) EmbedWithError(hwnd uintptr) (err error) {
 	//     且错误存到 window.__ltoolsInitErr（拼接各脚本错误）供诊断。
 	//   - 拆分多个小脚本（bridgeJS ~11KB / suppliersJS ~36KB 各自独立）规避单脚本超长被丢弃。
 	e.Init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}")
+	// 每个 ExtraInitScript 独立一次 e.Init（独立 AddScriptToExecuteOnDocumentCreated 调用），
+	// 绝不拼接——拼接后单脚本超长（bridgeJS+suppliersJS ~47KB）会被 WebView2 COM 静默丢弃。
+	// 各脚本 IIFE+try/catch 包裹，错误记到 window.__ltoolsInitErr 供 F12 诊断。
 	if len(ExtraInitScripts) > 0 {
-		// 所有应用脚本包在同一个 try/catch 里（window.__ltoolsInitErr 记录哪个出错）
-		var sb strings.Builder
-		sb.WriteString("window.__ltoolsInitErr='';")
-		for i, s := range ExtraInitScripts {
-			// 每个片段独立 try/catch，一个崩不影响后面（但都记录到 __ltoolsInitErr）
-			sb.WriteString(fmt.Sprintf("try{%s}catch(e){window.__ltoolsInitErr=(window.__ltoolsInitErr?window.__ltoolsInitErr+';':'')+'s'+%d+':'+String(e)}", s, i))
+		e.Init("window.__ltoolsInitErr='';")
+		for _, s := range ExtraInitScripts {
+			wrapped := fmt.Sprintf("(function(){try{%s}catch(e){window.__ltoolsInitErr=(window.__ltoolsInitErr?window.__ltoolsInitErr+';':'')+'s'+':'+String(e)}})()", s)
+			e.Init(wrapped)
 		}
-		e.Init(sb.String())
 	}
 	return nil
 }
