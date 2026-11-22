@@ -51,25 +51,53 @@ type windowEngine struct {
 	// 由 handleRawMessage 更新。CollectCurrentPage 纯读此缓存（不等待、不触发、不 HTTP 回退）。
 	lastPageMu   sync.Mutex
 	lastPageHTML pageHTMLPayload
+
+	// detailContact 缓存详情页 mtop 接口拦截到的 phone + address（c1688:detail）。
+	// 仅 detailEng 使用；列表引擎收到 c1688:detail 也写（但通常列表引擎不会收到）。
+	// ReadDetailContact 带超时等待（mtop 响应在页面加载后 1-2s 内到达）。
+	detailContactMu sync.Mutex
+	detailContact   detailContact
+	detailContactCh chan struct{} // 每次 c1688:detail 到达时非阻塞发一个 token
+
+	// pageChangeCh 翻页感知信号：collectJS 自动回传时若 Page 变化，非阻塞发一个 token。
+	// StartPages 在 p<pages 时阻塞等此信号（带超时），等用户翻到下一页 → 缓存更新 → 唤醒。
+	pageChangeCh chan struct{}
+	pageMu       sync.Mutex
+	lastPageNum  int // 上次 c1688:collect 的 Page（用于判断翻页）
+}
+
+// detailContact 详情页联系方式缓存（phone + address + 来源 URL + 时间戳）。
+type detailContact struct {
+	Phone   string
+	Address string
+	URL     string
+	TS      time.Time
 }
 
-// pageHTMLPayload 子窗口回传的页面载荷。
-// Items 是子窗口 JS 直接取到的结构化供应商数据（首选）；HTML 是兜底（Items 为空时 Go 端 parseHTML）。
-type pageHTMLPayload struct {
-	URL   string `json:"url"`
-	Title string `json:"title"`
-	HTML  string `json:"html"`
-	Items []Supplier `json:"items"`
-}
+// pageHTMLPayload 子窗口回传的页面载荷。
+// Items 是子窗口 JS 直接取到的结构化供应商数据（首选）；HTML 是兜底（Items 为空时 Go 端 parseHTML）。
+// Page 是 1688 结果页当前页码（beginPage），用于翻页感知。
+// Phone/Address 是详情页 mtop 接口补的联系方式（detailEng 专用）。
+type pageHTMLPayload struct {
+	URL     string     `json:"url"`
+	Title   string     `json:"title"`
+	HTML    string     `json:"html"`
+	Items   []Supplier `json:"items"`
+	Page    int        `json:"page"`
+	Phone   string     `json:"phone"`   // 详情页 mtop 补的手机号
+	Address   string     `json:"address"` // 详情页 mtop 补的地址
+}
 
 // newWindowEngine 创建一个 Wails 子窗口引擎。
 // htmlServerOwned 参数保留以兼容调用方，但 HTTP 回传已废弃，不再启动本地服务。
 func newWindowEngine(app *application.App, diagDir string, htmlServerOwned bool) *windowEngine {
 	e := &windowEngine{
-		app:        app,
-		name:       "c1688-window",
-		diagDir:    diagDir,
-		pageHTMLCh: make(chan pageHTMLPayload, 16),
+		app:             app,
+		name:            "c1688-window",
+		diagDir:         diagDir,
+		pageHTMLCh:      make(chan pageHTMLPayload, 16),
+		detailContactCh: make(chan struct{}, 8),
+		pageChangeCh:    make(chan struct{}, 4),
 	}
 	_ = htmlServerOwned // 已废弃：collectJS 走 window.external.invoke 官方通道，无需本地 HTTP 服务
 	return e
@@ -219,14 +247,52 @@ func (e *windowEngine) handleRawMessage(message string) {
 			return
 		}
 		if e.logf != nil {
-			e.logf(fmt.Sprintf("[回传] 收到 %d 条供应商（url=%s）via window.external.invoke", len(p.Items), p.URL))
+			e.logf(fmt.Sprintf("[回传] 收到 %d 条供应商（page=%d, url=%s）via window.external.invoke", len(p.Items), p.Page, p.URL))
 		}
 		// 写缓存：CollectCurrentPage 直接读此缓存（不等待、不触发、不 HTTP 回退）
 		e.lastPageMu.Lock()
 		e.lastPageHTML = p
 		e.lastPageMu.Unlock()
+		// 翻页感知：Page 变化（或首次）→ 非阻塞发 pageChangeCh token，唤醒 WaitForPageChange
+		e.pageMu.Lock()
+		pageChanged := e.lastPageNum == 0 || p.Page != e.lastPageNum
+		e.lastPageNum = p.Page
+		e.pageMu.Unlock()
+		if pageChanged {
+			select {
+			case e.pageChangeCh <- struct{}{}:
+			default:
+			}
+		}
 		select {
 		case e.pageHTMLCh <- p:
+		default:
+		}
+		return
+	}
+	// c1688:detail：detailCollectJS 从详情页 mtop 接口拦截到的 phone + address
+	if msg.Type == "c1688:detail" {
+		var d struct {
+			Phone   string `json:"phone"`
+			Address string `json:"address"`
+			URL     string `json:"url"`
+		}
+		if err := json.Unmarshal([]byte(message), &d); err != nil {
+			if e.logf != nil {
+				e.logf(fmt.Sprintf("[RawMsg] c1688:detail 解析失败：%v", err))
+			}
+			return
+		}
+		if e.logf != nil {
+			e.logf(fmt.Sprintf("[详情] 收到 phone=%s address=%s（url=%s）", d.Phone, d.Address, d.URL))
+		}
+		// 写 detailEng 的 contact 缓存（供 collectFromDetailWindow 读）
+		e.detailContactMu.Lock()
+		e.detailContact = detailContact{Phone: d.Phone, Address: d.Address, URL: d.URL, TS: time.Now()}
+		e.detailContactMu.Unlock()
+		// 唤醒等待的 StartPages（channel 非阻塞）
+		select {
+		case e.detailContactCh <- struct{}{}:
 		default:
 		}
 		return
@@ -294,10 +360,86 @@ func (e *windowEngine) routeWindowBack(w application.Window) {
 	w.Close()
 }
 
-// SetLogf 注入日志钩子（由 service 在创建后调用），供 OnCreate 兜底钩子写日志。
-func (e *windowEngine) SetLogf(fn func(string)) {
-	e.logf = fn
-}
+// SetLogf 注入日志钩子（由 service 在创建后调用），供 OnCreate 兜底钩子写日志。
+func (e *windowEngine) SetLogf(fn func(string)) {
+	e.logf = fn
+}
+
+// ResetDetailContact 清空 mtop contact 缓存（SetURL 到下一条详情页前调用，避免上条残留）。
+func (e *windowEngine) ResetDetailContact() {
+	e.detailContactMu.Lock()
+	e.detailContact = detailContact{}
+	e.detailContactMu.Unlock()
+}
+
+// DrainPageChange 清空 pageChangeCh 里残留的 token（StartPages 开始前调用，避免旧翻页信号误触发）。
+func (e *windowEngine) DrainPageChange() {
+	for {
+		select {
+		case <-e.pageChangeCh:
+		default:
+			return
+		}
+	}
+}
+
+// WaitForPageChange 阻塞等待用户翻到下一页（collectJS 自动回传 Page 变化触发）。
+// timeout 内等到 → 返回 true；超时 → 返回 false（StartPages 据此提示用户或跳过）。
+func (e *windowEngine) WaitForPageChange(ctx context.Context, timeout time.Duration, logf func(string)) bool {
+	// 先排空旧 token
+	e.DrainPageChange()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-e.pageChangeCh:
+		return true
+	case <-timer.C:
+		if logf != nil {
+			logf(fmt.Sprintf("等待翻页超时（%ds），用户未翻到下一页；本循环结束", int(timeout.Seconds())))
+		}
+		return false
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// ReadDetailContact 读 detailEng 的 mtop 拦截缓存（phone + address），带超时等待。
+// timeout 内 c1688:detail 到达 → 返回缓存；超时返回零值（phone/address 空）。
+// 典型调用：detailEng.SetURL(detailURL) 后调 ReadDetailContact(ctx, 5s) 等 mtop 响应。
+func (e *windowEngine) ReadDetailContact(ctx context.Context, timeout time.Duration, logf func(string)) (string, string) {
+	// 先读现有缓存（可能 mtop 已响应过）
+	e.detailContactMu.Lock()
+	dc := e.detailContact
+	e.detailContactMu.Unlock()
+	if dc.Phone != "" || dc.Address != "" {
+		return dc.Phone, dc.Address
+	}
+	// 等待 c1688:detail 到达（带超时 + ctx 取消）
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-e.detailContactCh:
+		// 收到 token，重读缓存
+		e.detailContactMu.Lock()
+		dc = e.detailContact
+		e.detailContactMu.Unlock()
+		if logf != nil && (dc.Phone == "" && dc.Address == "") {
+			logf("[详情] 等待 mtop 响应到达但缓存仍空（可能字段名需调，F12 查 __ltoolsDetailLastResp）")
+		}
+		return dc.Phone, dc.Address
+	case <-timer.C:
+		if logf != nil {
+			logf("[详情] 等待 mtop 响应超时（5s），phone/address 留空")
+		}
+		return "", ""
+	case <-ctx.Done():
+		if logf != nil {
+			logf("[详情] ctx 取消，停止等待 mtop 响应")
+		}
+		return "", ""
+	}
+}
+
 
 // drainChannel 清空 pageHTMLCh 里可能残留的旧 payload。
 func (e *windowEngine) drainChannel() {
@@ -379,13 +521,18 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 	if url == "" {
 		url = "https://www.1688.com/"
 	}
-	// 注入两个独立跨导航脚本（各 <12KB，AddScript 各调一次，避免 WebView2 单脚本超限静默丢弃）：
-	//   collectJS  = 取数（window.data.offerV2 精确路径）+ 自动回传（window.external.invoke）
-	//   navGuardJS = 导航拦截 + 浅色渲染
+	// 注入跨导航脚本（各 <12KB，AddScript 各调一次，避免 WebView2 单脚本超限静默丢弃）：
+	//   列表引擎（c1688-window）      → collectJS（取数+自动回传）+ navGuardJS（导航拦截+浅色）
+	//   详情引擎（c1688-detail-window）→ detailCollectJS（mtop XHR/fetch 拦截 phone+address）
 	// 跨导航注入（AddScriptToExecuteOnDocumentCreated，每个新文档 JS 运行前都执行），
 	// 不经过 ExecJS COM 调用（不碰 RESOURCE_NOT_IN_CORRECT_STATE）。
-	edge.SetExtraInitScripts(collectJS, navGuardJS)
-	log.Printf("[col1688] OpenWindow: ExtraInitScripts set（collectJS=%d, navGuardJS=%d）", len(collectJS), len(navGuardJS))
+	if e.name == "c1688-detail-window" {
+		edge.SetExtraInitScripts(detailCollectJS)
+		log.Printf("[col1688] OpenWindow(detail): ExtraInitScripts set（detailCollectJS=%d）", len(detailCollectJS))
+	} else {
+		edge.SetExtraInitScripts(collectJS, navGuardJS)
+		log.Printf("[col1688] OpenWindow: ExtraInitScripts set（collectJS=%d, navGuardJS=%d）", len(collectJS), len(navGuardJS))
+	}
 	win := e.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:          e.name,
 		Title:         "1688 搜索",
@@ -489,13 +636,20 @@ const collectJS = `
   function collect(){
     var list=[];
     var items=null;
+    var page=1;
     try{
       if (window.data && window.data.offerV2 && window.data.offerV2.response &&
           window.data.offerV2.response.data && window.data.offerV2.response.data.OFFER &&
           window.data.offerV2.response.data.OFFER.items) {
         items = window.data.offerV2.response.data.OFFER.items;
+        var off = window.data.offerV2.response.data.OFFER;
+        if (off.beginPage != null) { var b=parseInt(off.beginPage,10); if(b>0) page=b; }
       }
     }catch(e){}
+    // URL 兜底：1688 搜索结果页 URL 形如 .../offer_search.htm?keywords=x&page=2
+    if (page===1){
+      try{ var m=location.search.match(/[?&]page=(\d+)/); if(m) page=parseInt(m[1],10); }catch(e){}
+    }
     if (items && items.length){
       items.forEach(function(it){
         try{
@@ -512,12 +666,13 @@ const collectJS = `
       });
     }
     window.__ltoolsCollectItems = list;
+    window.__ltoolsCollectPage = page;
     window.__ltoolsCollectItemsJSON = JSON.stringify(list||[]);
-    return list;
+    return {items:list, page:page};
   }
   // 文档创建时立即跑一次（此时 1688 数据多半没到，结果空；后续自动回传轮询会重取）
   collect();
-  window.__ltoolsCollectItemsRefresh = collect;
+  window.__ltoolsCollectItemsRefresh = function(){ var r=collect(); window.__ltoolsCollectItems=r.items; window.__ltoolsCollectPage=r.page; return r.items; };
 
   // ---- 自动回传：等数据就绪再取 + invoke（不靠 Go 端 ExecJS 触发）----
   // 1688 的 window.data / DOM 在 document.readyState=complete 后才稳定。
@@ -534,17 +689,19 @@ const collectJS = `
       if (window.__ltoolsCollectPolls > 10) { clearInterval(timer); }
       return;
     }
-    sent = true;
-    window.__ltoolsCollectSent = true;
-    clearInterval(timer);
-    var items = collect();
-    var payload = {
-      type: 'c1688:collect',
-      items: items,
-      url: location.href,
-      title: document.title,
-      ts: Date.now()
-    };
+    sent = true;
+    window.__ltoolsCollectSent = true;
+    clearInterval(timer);
+    var r = collect();
+    var items = r.items;
+    var payload = {
+      type: 'c1688:collect',
+      items: items,
+      page: r.page,
+      url: location.href,
+      title: document.title,
+      ts: Date.now()
+    };
     if (window.external && window.external.invoke) {
       try { window.external.invoke(JSON.stringify(payload)); } catch(e){}
     }
@@ -688,6 +845,119 @@ const navGuardJS = `
 `
 
 
+// detailCollectJS 注入详情页子窗口的跨导航脚本（detailEng 专用）。
+//
+// 1688 详情页（*.1688.com/page/contactinfo.htm）的电话/地址不在 DOM 里，而是页面加载时
+// 异步请求 mtop 接口：
+//   https://h5api.m.1688.com/h5/mtop.alibaba.alisite.cbu.server.pc.moduleasyncservice/1.0/
+// 响应体含手机号 + 地址（字段名未完全确认，用多 key 兜）。
+//
+// 本脚本 hook XMLHttpRequest + fetch，拦截该 mtop 接口的响应，解析出 phone + address，
+// 经 window.external.invoke({type:'c1688:detail', phone, address, url, ts}) 回传 Go 端。
+//
+// 幂等：window.__ltoolsDetailInstalled 标记。每次进新详情页 JS 上下文重置，重执行。
+const detailCollectJS = `
+(function(){
+  if (window.__ltoolsDetailInstalled) return;
+  window.__ltoolsDetailInstalled = true;
+
+  var MTOP_API = "mtop.alibaba.alisite.cbu.server.pc.moduleasyncservice";
+
+  var PHONE_KEYS = ["mobile","phone","tel","telephone","contactPhone","mobileNo","contactMobile","telNo","phoneNumber","mobilePhone"];
+  function pick(obj, keys){
+    if(!obj || typeof obj !== "object") return "";
+    for(var i=0;i<keys.length;i++){
+      var v = obj[keys[i]];
+      if(v != null && String(v).trim() !== "") return String(v).trim();
+    }
+    return "";
+  }
+  function normPhone(s){
+    if(s == null) return "";
+    s = String(s).trim();
+    if(/^\d{11}$/.test(s)) return s;
+    if(/^0\d{2,3}-?\d{7,8}$/.test(s)) return s;
+    if(/\*{2,}/.test(s)) return "";
+    return s;
+  }
+  function extractPhoneAddr(root){
+    var phone = "", addr = "";
+    function walk(v, depth){
+      if(!v || depth > 8) return;
+      if(typeof v === "object"){
+        if(!phone){ phone = normPhone(pick(v, PHONE_KEYS)); }
+        if(!addr){
+          var parts = [];
+          ["province","provinceName","city","cityName","town","townName","address","fullAddress","companyAddress","detailAddress","addr"].forEach(function(k){
+            if(v[k] != null && String(v[k]).trim() !== "") parts.push(String(v[k]).trim());
+          });
+          addr = parts.join("");
+        }
+        for(var k in v){
+          if(v.hasOwnProperty(k)) walk(v[k], depth+1);
+        }
+      }
+    }
+    walk(root, 0);
+    return { phone: phone, address: addr };
+  }
+
+  function sendBack(text){
+    try{
+      var j = JSON.parse(text);
+      var pa = extractPhoneAddr(j);
+      window.__ltoolsDetailLastResp = j;
+      if(pa.phone || pa.address){
+        if (window.external && window.external.invoke) {
+          window.external.invoke(JSON.stringify({
+            type: "c1688:detail",
+            phone: pa.phone,
+            address: pa.address,
+            url: location.href,
+            ts: Date.now()
+          }));
+        }
+      }
+    }catch(e){}
+  }
+
+  var origOpen = XMLHttpRequest.prototype.open;
+  var origSend = XMLHttpRequest.prototype.send;
+  XMLHttpRequest.prototype.open = function(method, url){
+    this.__ltoolsUrl = url;
+    return origOpen.apply(this, arguments);
+  };
+  XMLHttpRequest.prototype.send = function(){
+    var xhr = this;
+    xhr.addEventListener("load", function(){
+      try{
+        var u = String(xhr.__ltoolsUrl || "");
+        if(u.indexOf(MTOP_API) > -1){
+          sendBack(xhr.responseText);
+        }
+      }catch(e){}
+    });
+    return origSend.apply(this, arguments);
+  };
+
+  var origFetch = window.fetch;
+  if (origFetch) {
+    window.fetch = function(input, init){
+      var url = (typeof input === "string") ? input : (input && input.url) || "";
+      var p = origFetch.apply(this, arguments);
+      p.then(function(resp){
+        try{
+          if(String(url).indexOf(MTOP_API) > -1){
+            resp.clone().text().then(sendBack).catch(function(){});
+          }
+        }catch(e){}
+      }).catch(function(){});
+      return p;
+    };
+  }
+})();
+`
+
 // truncateStr 截断长字符串（日志用）。
 func truncateStr(s string, n int) string {
 	if len(s) <= n {

@@ -319,7 +319,7 @@ func (s *Collect1688Service) Stop() {
 
 // StartPages 自动多页采集（Go 端编排）：
 // 用户在子窗口里先手动搜到结果页（登录/关键词/类别），然后点本按钮，
-// 程序自动：滚到底 → 取当前页数据 → 点下一页 → 翻页间隔 DelaySec → 重复，共 Pages 页。
+// 程序自动：取当前页数据 → 等用户翻到下一页（collectJS 自动回传 Page 变化触发，60s 超时）→ 取新页 → 重复，共 Pages 页。
 // 全程在子窗口内（COM 拦截保证不冒新窗）。累积去重结果，每页推 c1688:progress。
 //
 // opts.Pages 0 或缺省 → 3 页；opts.DelaySec 0 → 2s；opts.MaxCount 0 → 不限。
@@ -328,10 +328,11 @@ func (s *Collect1688Service) Stop() {
 //
 // 双窗编排（可选，opts.DetailEnabled=true）：
 //   - 每页采完列表数据后，对 item.Url（去重）最多 opts.DetailPerPage 条（默认 5、上限 10）
-//     在 detailEngine（独立子窗口）里 SetURL 逐个访问，用 collectFromDetailWindow 补电话。
+//     在 detailEngine（独立子窗口）里 SetURL 到 详情页 contactinfo.htm，
+//     detailCollectJS hook mtop 接口拦截 phone + address，经 c1688:detail 回传补进 Supplier。
 //   - 节奏：详情间隔 800ms + 0~400ms 抖动（模拟浏览，不固定节拍）；详情被拒（取不到）→
 //     日志提示后自动停当轮详情循环，列表采集继续。
-//   - 详情窗口首登：首次使用请先点「打开详情窗（首登）」登录 1688（登录态持久在 detail 窗口）。
+//   - 详情页子窗口由本方法自动开关（首次自动打开，登录态持久），前端不暴露详情页控件。
 func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 	s.mu.Lock()
 	if s.running {
@@ -399,6 +400,9 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 		var lastFingerprint string
 		stuckCount := 0
 		seenDetailURLs := map[string]bool{} // 跨页去重，同一条不重复开详情
+		// 清空旧翻页信号（避免上次采集残留 token 误触发）
+		s.engine.DrainPageChange()
+		pageTimeout := 60 * time.Second // 每页等待用户翻页的超时
 
 		for p := 1; p <= pages; p++ {
 			select {
@@ -451,7 +455,13 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 					}
 				}
 				if len(toDetail) > 0 {
-					s.logf(fmt.Sprintf("第 %d/%d 页：补电话（详情窗访问 %d 条）", p, pages, len(toDetail)))
+					s.logf(fmt.Sprintf("第 %d/%d 页：补电话/地址（详情窗访问 %d 条）", p, pages, len(toDetail)))
+					// 自动开 detailEng（前端不暴露详情页控件，由实际情况控制）
+					if !s.detailEng.IsWindowOpen() {
+						s.logf("详情窗未开，自动打开（首次使用请先在详情窗完成 1688 登录）")
+						_ = s.detailEng.OpenWindow(ctx, "")
+						time.Sleep(2 * time.Second)
+					}
 					for i, it := range toDetail {
 						select {
 						case <-ctx.Done():
@@ -461,30 +471,40 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 						}
 						// 节奏：800ms + 0~400ms 抖动（模拟浏览）
 						time.Sleep(800*time.Millisecond + time.Duration(rand.Intn(400))*time.Millisecond)
-						if !s.detailEng.SetURL(ctx, it.URL) {
+						dURL := detailURL(it.URL)
+						if dURL == "" {
+							s.logf(fmt.Sprintf("第%d/%d 条：URL 为空，跳过", i+1, len(toDetail)))
+							continue
+						}
+						// 清掉旧 contact 缓存（避免上条残留）
+						s.detailEng.ResetDetailContact()
+						if !s.detailEng.SetURL(ctx, dURL) {
 							s.logf("详情窗 SetURL 失败，跳过本条")
 							continue
 						}
-						// 等导航稳定（bridge 80ms 重注 + 详情页加载）
-						time.Sleep(2 * time.Second)
-						detailItems := s.collectFromDetailWindow(ctx)
-						phone := pickPhoneFromItems(detailItems, it)
-						if phone != "" {
+						// 等 mtop 响应（ReadDetailContact 带 6s 超时）
+						phone, addr := s.collectFromDetailWindow(ctx)
+						if phone != "" || addr != "" {
 							s.mu.Lock()
 							for k := range s.results {
 								if s.results[k].URL == it.URL && s.results[k].Name == it.Name {
-									s.results[k].Phone = phone
+									if phone != "" {
+										s.results[k].Phone = phone
+									}
+									if addr != "" {
+										s.results[k].Address = addr
+									}
 									break
 								}
 							}
 							s.mu.Unlock()
-							s.logf(fmt.Sprintf("详情窗 第%d/%d 条：补到电话 %s（%s）", i+1, len(toDetail), phone, it.Name))
+							s.logf(fmt.Sprintf("详情窗 第%d/%d 条：phone=%s address=%s（%s）", i+1, len(toDetail), phone, addr, it.Name))
 						} else {
-							// 被 baxia 拒 / 未取到 → 当轮详情停（避免反复撞风控）
-							s.logf(fmt.Sprintf("详情窗 第%d/%d 条未取到电话（可能被 baxia 拦截）；当轮详情循环已停，列表采集继续", i+1, len(toDetail)))
+							// 被 baxia 拒 / mtop 未响应 / 字段名需调 → 当轮详情停
+							s.logf(fmt.Sprintf("详情窗 第%d/%d 条未取到 phone/address（可能被 baxia 拦或字段名需调，F12 查 __ltoolsDetailLastResp）；当轮详情循环已停，列表采集继续", i+1, len(toDetail)))
 							break
 						}
-						// 推送中间结果（补了电话的部分）
+						// 推送中间结果（补了 phone+address 的部分）
 						s.mu.Lock()
 						cur := make([]Supplier, len(s.results))
 						copy(cur, s.results)
@@ -522,10 +542,21 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 			}
 			lastFingerprint = fp
 
-			// 翻页已废弃（ClickNextPage 删除）：多页采集需用户手动在子窗口点「下一页」，
-			// 再点一次「采集当前页」（前端会再次调用本方法）。本循环内 p 仍递增，
-			// 但同一页重复采会因去重（seenNames）而新增 0 条，实际只第 1 页有数据。
-			_ = p
+			// 翻页可等待：p < pages 时阻塞等用户翻到下一页（collectJS 自动回传 Page 变化触发）。
+			// 超时 60s → 用户未翻 → 本循环结束（已采的保留，未采的不再采）。
+			if p < pages {
+				s.logf(fmt.Sprintf("等待用户翻到第 %d 页（%ds 内）...", p+1, int(pageTimeout.Seconds())))
+				ok := s.engine.WaitForPageChange(ctx, pageTimeout, func(m string) {
+					s.logf(m)
+				})
+				if !ok {
+					break
+				}
+				// 翻页成功，下一轮 p+1 会读新页缓存
+				continue
+			}
+			// p == pages：最后一页，跳出循环
+			break
 		}
 
 		s.mu.Lock()
@@ -553,54 +584,35 @@ func fingerprint(items []Supplier) string {
 	return b.String()
 }
 
-// OpenDetailWindow 打开（或聚焦）详情页子窗口。url 为空时到 1688 首页（供首登）。
-// 用于"列表采集 + 详情补电话"双窗编排：用户先在本窗口登录 1688（登录态持久在 detail 引擎窗口），
-// 之后 StartPages 会自动 SetURL 到各 item.Url 取电话。
-func (s *Collect1688Service) OpenDetailWindow() error {
-	if err := s.detailEng.OpenWindow(context.Background(), ""); err != nil {
-		s.logf(err.Error())
-		return err
-	}
-	s.logf("已打开详情页子窗口（1688 首页，供首登；登录态持久，下次免登）")
-	return nil
-}
+// 详情页子窗口由 StartPages 内部自动开关（首次自动打开，登录态持久），
+// 前端不暴露 OpenDetailWindow/CloseDetailWindow/IsDetailWindowOpen 控件。
 
-// CloseDetailWindow 关闭详情页子窗口。
-func (s *Collect1688Service) CloseDetailWindow() {
-	s.detailEng.CloseWindow()
-	s.logf("已关闭详情页子窗口")
-}
-
-// IsDetailWindowOpen 详情页子窗口是否还开着。
-func (s *Collect1688Service) IsDetailWindowOpen() bool {
-	return s.detailEng.IsWindowOpen()
-}
-
-// collectFromDetailWindow 把 detailEngine 当前页解析成供应商（用于从详情页补电话）。
-// 返回 nil 表示取不到（窗口未开 / 回传超时 / 非详情页）。
-func (s *Collect1688Service) collectFromDetailWindow(ctx context.Context) []Supplier {
+// collectFromDetailWindow 从 detailEng 的 mtop 拦截缓存读 phone + address。
+// 调用前 detailEng 已 SetURL 到详情页；mtop 响应在页面加载后 1-2s 内到达。
+// 返回 (phone, address)；超时/取不到返回两个空串。
+func (s *Collect1688Service) collectFromDetailWindow(ctx context.Context) (string, string) {
 	if !s.detailEng.IsWindowOpen() {
-		return nil
+		return "", ""
 	}
-	return s.detailEng.CollectCurrentPage(ctx, "详情页", func(msg string) {
+	return s.detailEng.ReadDetailContact(ctx, 6*time.Second, func(msg string) {
 		s.logf(msg)
 	})
 }
 
-// pickPhoneFromItems 从 detail 引擎采到的 items 里挑一个电话（供 StartPages 补电话用）。
-// 优先 name 与 it.Name 匹配；否则取第一条非空 phone。
-func pickPhoneFromItems(items []Supplier, it Supplier) string {
-	for _, d := range items {
-		if d.Phone != "" && it.Name != "" && d.Name == it.Name {
-			return d.Phone
-		}
+// detailURL 把列表项的 shopLinkUrl 拼成详情页 contactinfo URL。
+// shopLinkUrl 形如 https://kashashipin.1688.com/ 或 https://kashashipin.1688.com
+// → https://kashashipin.1688.com/page/contactinfo.htm
+func detailURL(shopLink string) string {
+	shopLink = strings.TrimSpace(shopLink)
+	if shopLink == "" {
+		return ""
 	}
-	for _, d := range items {
-		if d.Phone != "" {
-			return d.Phone
-		}
+	// 去掉尾斜杠，保证拼接一致
+	shopLink = strings.TrimRight(shopLink, "/")
+	if !strings.Contains(shopLink, "://") {
+		shopLink = "https://" + shopLink
 	}
-	return ""
+	return shopLink + "/page/contactinfo.htm"
 }
 
 // GetResults 取当前结果。
