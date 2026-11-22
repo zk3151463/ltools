@@ -592,8 +592,8 @@ func (e *windowEngine) OpenWindow(ctx context.Context, url string) error {
 	// Wails 框架层在 WebView2 初始化完成后调用 e.Init(initScript)，initScript 包含：
 	//   window.external={invoke:...}; <ExtraInitScript>
 	// col1688 用 ExtraInitScript 注入 bridgeJS（__ltoolsCollect + c1688:connected）+ suppliersJS。
-	edge.SetExtraInitScript(bridgeJS + "\n" + suppliersJS)
-	log.Printf("[col1688] OpenWindow: ExtraInitScript set（len=%d）", len(bridgeJS)+len(suppliersJS))
+	edge.SetExtraInitScript(bridgeJS)
+	log.Printf("[col1688] OpenWindow: ExtraInitScript set（bridgeJS len=%d）", len(bridgeJS))
 	win := e.app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:          e.name,
 		Title:         "1688 搜索",

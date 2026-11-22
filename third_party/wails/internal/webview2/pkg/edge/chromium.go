@@ -458,7 +458,13 @@ func (e *Chromium) Init(script string) {
 	fmt.Printf("[WebView2] Init script（len=%d, hasBridgeJS=%v）\n", len(script), hasBridge)
 	err := e.webview.AddScriptToExecuteOnDocumentCreated(script, nil)
 	if err != nil {
-		fmt.Printf("[WebView2] AddScriptToExecuteOnDocumentCreated FAILED（hasBridgeJS=%v）: %v\n", hasBridge, err)
+		// 诊断：脚本过长是 AddScriptToExecuteOnDocumentCreated 失败的常见原因（COM 调用对超长字符串静默失败）
+		// 若 len > 8KB 且失败，提示调用方拆分脚本
+		if len(script) > 8192 {
+			fmt.Printf("[WebView2] AddScriptToExecuteOnDocumentCreated FAILED（hasBridgeJS=%v, len=%d >8KB 疑似脚本过长）: %v\n", hasBridge, len(script), err)
+		} else {
+			fmt.Printf("[WebView2] AddScriptToExecuteOnDocumentCreated FAILED（hasBridgeJS=%v, len=%d）: %v\n", hasBridge, len(script), err)
+		}
 	} else {
 		fmt.Printf("[WebView2] AddScriptToExecuteOnDocumentCreated OK（hasBridgeJS=%v, len=%d）\n", hasBridge, len(script))
 	}
