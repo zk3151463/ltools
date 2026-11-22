@@ -150,6 +150,7 @@ func (e *windowEngine) registerEvents() {
 	SetRawMessageHandler(func(message string) {
 		e.handleRawMessage(message)
 	})
+	log.Printf("[col1688] registerEvents: raw message handler registered（engine=%s）", e.name)
 	_ = e.app.Event.On("c1688:page-html", func(ev *application.CustomEvent) {
 		if ev == nil || ev.Data == nil {
 			return

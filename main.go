@@ -123,6 +123,7 @@ func main() {
 		// col1688.DispatchRawMessage → 各 engine 的 handleRawMessage → pageHTMLCh。
 		// WebView2 原生通信，不被 CSP 拦，不走 127.0.0.1。
 		RawMessageHandler: func(window application.Window, message string, originInfo *application.OriginInfo) {
+			log.Printf("[Main] RawMessageHandler called（len=%d, origin=%v）", len(message), originInfo)
 			col1688.DispatchRawMessage(message)
 		},
 	})
