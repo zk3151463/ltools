@@ -446,11 +446,14 @@ func (e *Chromium) NavigateToString(content string) {
 
 func (e *Chromium) Init(script string) {
 	if e.webview == nil || e.shuttingDown {
+		// 诊断：webview 为 nil 或正在关闭，Init 没执行（bridgeJS 不会注入）
+		log.Printf("[WebView2] Init skipped（webviewNil=%v, shuttingDown=%v）", e.webview == nil, e.shuttingDown)
 		return
 	}
 	// 诊断日志：确认 initScript 是否包含 ExtraInitScript（bridgeJS）
-	// 前 100 字符 + 总长度，用于判断 col1688 的 bridgeJS 是否被注入
-	log.Printf("[WebView2] Init script（len=%d, head=%s...）", len(script), func() string {
+	// 搜 "ltoolsBridgeInstalled" 子串判断 bridgeJS 是否被拼进来
+	hasBridge := strings.Contains(script, "ltoolsBridgeInstalled")
+	log.Printf("[WebView2] Init script（len=%d, hasBridgeJS=%v, head=%s...）", len(script), hasBridge, func() string {
 		if len(script) > 100 {
 			return script[:100]
 		}
@@ -459,6 +462,8 @@ func (e *Chromium) Init(script string) {
 	err := e.webview.AddScriptToExecuteOnDocumentCreated(script, nil)
 	if err != nil {
 		log.Printf("[WebView2] Init script registration failed: %v", err)
+	} else {
+		log.Printf("[WebView2] AddScriptToExecuteOnDocumentCreated OK（hasBridgeJS=%v）", hasBridge)
 	}
 }
 
