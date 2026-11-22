@@ -69,10 +69,7 @@ func NewCollect1688Service(app *application.App, dataDir string) *Collect1688Ser
 	// 注册子窗口回传 HTML 的事件监听 + 窗口创建兜底（必须在任何 OpenWindow 之前）
 	svc.engine.registerEvents()
 	svc.detailEng.registerEvents()
-	// 启动子窗口 HTML 回传的本地回环 HTTP 服务（外部页 fetch POST 回来；必须在 OpenWindow 前）。
-	// 列表引擎已在 newWindowEngine(owned=true) 里起过，详情引擎 startHTMLReturn 幂等跳过。
-	svc.engine.startHTMLReturn()
-	svc.detailEng.startHTMLReturn()
+	// HTML 回传已废弃（collectJS 走 window.external.invoke 官方通道，无需 127.0.0.1 本地服务）。
 	return svc
 }
 
@@ -411,9 +408,6 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 			default:
 			}
 
-			s.logf(fmt.Sprintf("第 %d/%d 页：滚动加载…", p, pages))
-			s.engine.ScrollToBottom(1200 * time.Millisecond)
-
 			src := fmt.Sprintf("子窗口 第%d页", p)
 			items := s.engine.CollectCurrentPage(ctx, src, func(m string) {
 				s.logf(m)
@@ -528,22 +522,10 @@ func (s *Collect1688Service) StartPages(opts CollectOptions) error {
 			}
 			lastFingerprint = fp
 
-			// 最后一页不翻页
-			if p == pages {
-				break
-			}
-
-			s.logf("点「下一页」…")
-			// ClickNextPage 现走 ExecJSResult 读回：true=真点了，false=明确到底/没下一页。
-			// 读回失败时内部退化为盲点并返回 true（旧语义，靠指纹兜底）。
-			if !s.engine.ClickNextPage() {
-				s.logf("下一页明确未命中（翻页到底 / 无下一页），提前结束")
-				break
-			}
-			// 等导航稳定 + 翻页间隔（防风控）
-			time.Sleep(delay)
-			// 再等 1s 让 bridge 重注 + 新文档加载
-			time.Sleep(1 * time.Second)
+			// 翻页已废弃（ClickNextPage 删除）：多页采集需用户手动在子窗口点「下一页」，
+			// 再点一次「采集当前页」（前端会再次调用本方法）。本循环内 p 仍递增，
+			// 但同一页重复采会因去重（seenNames）而新增 0 条，实际只第 1 页有数据。
+			_ = p
 		}
 
 		s.mu.Lock()
