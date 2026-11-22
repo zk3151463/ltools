@@ -297,13 +297,15 @@ func (e *Chromium) EmbedWithError(hwnd uintptr) (err error) {
 		return fmt.Errorf("WebView2 controller did not complete initialisation within %s", embedTimeout)
 	}
 	// 注入 window.external.invoke（Wails 框架层通信）+ ExtraInitScript（应用层额外脚本）。
-	// ExtraInitScript 是跨导航的（AddScriptToExecuteOnDocumentCreated），每个新文档都执行。
-	// col1688 用它注入 bridgeJS + suppliersJS，不经过 ExecJS COM 调用（不碰 bad state）。
-	initScript := "window.external={invoke:s=>window.chrome.webview.postMessage(s)}"
+	// 关键：分两次 AddScriptToExecuteOnDocumentCreated 注册，互不影响。
+	//   - 第 1 个脚本只定义 window.external（Wails 核心通信），绝不能让应用脚本的语法错误破坏它。
+	//   - 第 2 个脚本是 ExtraInitScript（col1688 的 bridgeJS + suppliersJS），包 try/catch，
+	//     抛错不影响已注入的 window.external，且错误存到 window.__ltoolsInitErr 供诊断。
+	// AddScriptToExecuteOnDocumentCreated 是跨导航的（每个新文档 JS 运行前执行），不碰 bad state。
+	e.Init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}")
 	if ExtraInitScript != "" {
-		initScript += ";" + ExtraInitScript
+		e.Init("try{" + ExtraInitScript + "}catch(e){window.__ltoolsInitErr=String(e)}")
 	}
-	e.Init(initScript)
 	return nil
 }
 

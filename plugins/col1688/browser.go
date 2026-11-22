@@ -733,6 +733,8 @@ const diagnoseJS = `
 // 把"整页导航后 hook 空窗"从 80ms 压到 ~0，使"导航完成瞬间点 _blank 链接/翻页"也能当场重定向。
 const bridgeJS = `
 (function(){
+  // ---- 诊断：bridgeJS 成功执行到时设标志（F12 可读 window.__ltoolsInitOk）----
+  window.__ltoolsInitOk = true;
   // ---- 幂等：本文档已装则直接返回 ----
   if (window.__ltoolsBridgeInstalled) return;
   window.__ltoolsBridgeInstalled = true;
